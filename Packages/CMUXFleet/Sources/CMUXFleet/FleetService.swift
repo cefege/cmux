@@ -15,6 +15,8 @@ public struct FleetServiceConfig: Sendable {
 
 public typealias FleetRequestHandler = @Sendable (FleetHTTPRequest, FleetRequestContext) async -> FleetHTTPResponse
 
+public typealias FleetWebSocketHandler = @Sendable (FleetWebSocketChannel, FleetRequestContext) async -> Void
+
 public struct FleetRequestContext: Sendable {
     /// Tailscale identity of the peer (resolved via `tailscale whois`). `nil` when
     /// the request was rejected by auth and is about to be dropped — handlers
@@ -22,6 +24,16 @@ public struct FleetRequestContext: Sendable {
     public let peer: TailscaleWhois?
     public let peerAddress: String
     public let peerPort: UInt16
+}
+
+public struct FleetWebSocketEndpoint: Sendable {
+    public let path: String
+    public let handler: FleetWebSocketHandler
+
+    public init(path: String, handler: @escaping FleetWebSocketHandler) {
+        self.path = path
+        self.handler = handler
+    }
 }
 
 public enum FleetServiceError: Error, CustomStringConvertible {
@@ -51,10 +63,12 @@ public final class FleetService: @unchecked Sendable {
     private let probe: TailscaleProbe
     private let selfUserId: Int64
     private let handler: FleetRequestHandler
+    private let webSocketEndpoint: FleetWebSocketEndpoint?
     private let queue: DispatchQueue
     private let lock = NSLock()
     private var listener: NWListener?
     private var activeConnections: Set<ObjectIdentifier> = []
+    private var activeChannels: [ObjectIdentifier: FleetWebSocketChannel] = [:]
     private var resolvedPort: UInt16 = 0
     private var startError: Error?
     private let whoisCache = WhoisCache(ttlSeconds: 60)
@@ -63,12 +77,14 @@ public final class FleetService: @unchecked Sendable {
         config: FleetServiceConfig,
         probe: TailscaleProbe,
         selfUserId: Int64,
-        handler: @escaping FleetRequestHandler
+        handler: @escaping FleetRequestHandler,
+        webSocketEndpoint: FleetWebSocketEndpoint? = nil
     ) {
         self.config = config
         self.probe = probe
         self.selfUserId = selfUserId
         self.handler = handler
+        self.webSocketEndpoint = webSocketEndpoint
         self.queue = DispatchQueue(label: "cmux.fleet.service", qos: .userInitiated, attributes: .concurrent)
     }
 
@@ -147,9 +163,14 @@ public final class FleetService: @unchecked Sendable {
     public func stop() {
         lock.lock()
         let listener = self.listener
+        let channels = Array(activeChannels.values)
         self.listener = nil
+        self.activeChannels.removeAll()
         lock.unlock()
         listener?.cancel()
+        for channel in channels {
+            channel.close(code: 1001, reason: "service stopping")
+        }
     }
 
     private func ipv4HostEndpoint() -> NWEndpoint.Host? {
@@ -188,30 +209,64 @@ public final class FleetService: @unchecked Sendable {
 
     private func handleAccepted(_ connection: NWConnection, cleanup: @escaping @Sendable () -> Void) {
         let (peerAddress, peerPort) = peerEndpoint(connection)
-        readUntilRequest(connection: connection, buffer: Data(), cleanup: cleanup) { [weak self] request in
+        readUntilRequest(connection: connection, buffer: Data(), cleanup: cleanup) { [weak self] request, leftover in
             guard let self = self else {
                 cleanup()
                 return
             }
             Task {
-                let response = await self.authenticateAndDispatch(
+                await self.dispatchRequest(
+                    connection: connection,
                     request: request,
+                    leftover: leftover,
                     peerAddress: peerAddress,
-                    peerPort: peerPort
+                    peerPort: peerPort,
+                    cleanup: cleanup
                 )
-                let data = FleetHTTPParser.serialize(response)
-                connection.send(content: data, completion: .contentProcessed { _ in
-                    cleanup()
-                })
             }
         }
     }
 
-    private func authenticateAndDispatch(
+    private func dispatchRequest(
+        connection: NWConnection,
         request: FleetHTTPRequest,
+        leftover: Data,
         peerAddress: String,
-        peerPort: UInt16
-    ) async -> FleetHTTPResponse {
+        peerPort: UInt16,
+        cleanup: @escaping @Sendable () -> Void
+    ) async {
+        let auth = await authenticate(peerAddress: peerAddress, peerPort: peerPort)
+        switch auth {
+        case .rejected(let response):
+            sendAndClose(connection: connection, response: response, cleanup: cleanup)
+        case .accepted(let whois):
+            let context = FleetRequestContext(peer: whois, peerAddress: peerAddress, peerPort: peerPort)
+            if let endpoint = webSocketEndpoint,
+               request.method.uppercased() == "GET",
+               request.path == endpoint.path,
+               Self.isWebSocketUpgrade(request)
+            {
+                await performUpgrade(
+                    connection: connection,
+                    request: request,
+                    leftover: leftover,
+                    context: context,
+                    endpoint: endpoint,
+                    cleanup: cleanup
+                )
+            } else {
+                let response = await handler(request, context)
+                sendAndClose(connection: connection, response: response, cleanup: cleanup)
+            }
+        }
+    }
+
+    private enum AuthResult {
+        case accepted(TailscaleWhois)
+        case rejected(FleetHTTPResponse)
+    }
+
+    private func authenticate(peerAddress: String, peerPort: UInt16) async -> AuthResult {
         let nowUnix = Int64(Date().timeIntervalSince1970)
         let whois: TailscaleWhois?
         if let cached = whoisCache.get(key: peerAddress, now: nowUnix) {
@@ -223,21 +278,120 @@ public final class FleetService: @unchecked Sendable {
         }
 
         guard let whois = whois else {
-            return .plainText(403, "Forbidden", "whois failed")
+            return .rejected(.plainText(403, "Forbidden", "whois failed"))
         }
         guard whois.user?.id == selfUserId else {
-            return .plainText(403, "Forbidden", "different tailnet user")
+            return .rejected(.plainText(403, "Forbidden", "different tailnet user"))
+        }
+        return .accepted(whois)
+    }
+
+    private static func isWebSocketUpgrade(_ request: FleetHTTPRequest) -> Bool {
+        let upgrade = (request.headers["upgrade"] ?? "").lowercased()
+        return upgrade.contains("websocket")
+    }
+
+    private func performUpgrade(
+        connection: NWConnection,
+        request: FleetHTTPRequest,
+        leftover: Data,
+        context: FleetRequestContext,
+        endpoint: FleetWebSocketEndpoint,
+        cleanup: @escaping @Sendable () -> Void
+    ) async {
+        let handshake: FleetHTTPResponse
+        do {
+            handshake = try FleetWebSocket.handshakeResponse(forRequestHeaders: request.headers)
+        } catch {
+            sendAndClose(
+                connection: connection,
+                response: .plainText(400, "Bad Request", "websocket: \(error)"),
+                cleanup: cleanup
+            )
+            return
         }
 
-        let context = FleetRequestContext(peer: whois, peerAddress: peerAddress, peerPort: peerPort)
-        return await handler(request, context)
+        let handshakeBytes = FleetHTTPParser.serialize(handshake)
+        do {
+            try await sendAsync(connection: connection, data: handshakeBytes)
+        } catch {
+            cleanup()
+            return
+        }
+
+        // Connection ownership moves from "in-flight HTTP request" to the
+        // channel. Drop it from activeConnections and track the channel
+        // separately so stop() can close upgraded clients explicitly.
+        unregisterConnection(ObjectIdentifier(connection))
+
+        let channelBox = WeakChannelBox()
+        let onChannelClose: @Sendable () -> Void = { [weak self] in
+            guard let self = self else { return }
+            guard let channel = channelBox.channel else { return }
+            self.unregisterChannel(ObjectIdentifier(channel))
+        }
+
+        let channel = FleetWebSocketChannel(
+            connection: connection,
+            queue: queue,
+            initialBuffer: leftover,
+            onClose: onChannelClose
+        )
+        channelBox.channel = channel
+        registerChannel(channel)
+
+        await endpoint.handler(channel, context)
+        // The handler returned — make sure the connection is torn down.
+        channel.close()
+    }
+
+    private func unregisterConnection(_ id: ObjectIdentifier) {
+        lock.lock()
+        activeConnections.remove(id)
+        lock.unlock()
+    }
+
+    private func registerChannel(_ channel: FleetWebSocketChannel) {
+        let id = ObjectIdentifier(channel)
+        lock.lock()
+        activeChannels[id] = channel
+        lock.unlock()
+    }
+
+    private func unregisterChannel(_ id: ObjectIdentifier) {
+        lock.lock()
+        activeChannels.removeValue(forKey: id)
+        lock.unlock()
+    }
+
+    private func sendAndClose(
+        connection: NWConnection,
+        response: FleetHTTPResponse,
+        cleanup: @escaping @Sendable () -> Void
+    ) {
+        let data = FleetHTTPParser.serialize(response)
+        connection.send(content: data, completion: .contentProcessed { _ in
+            cleanup()
+        })
+    }
+
+    private func sendAsync(connection: NWConnection, data: Data) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            connection.send(content: data, completion: .contentProcessed { error in
+                if let error = error {
+                    cont.resume(throwing: error)
+                } else {
+                    cont.resume()
+                }
+            })
+        }
     }
 
     private func readUntilRequest(
         connection: NWConnection,
         buffer: Data,
         cleanup: @escaping @Sendable () -> Void,
-        onComplete: @escaping @Sendable (FleetHTTPRequest) -> Void
+        onComplete: @escaping @Sendable (FleetHTTPRequest, Data) -> Void
     ) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { data, _, isComplete, error in
             if error != nil {
@@ -250,7 +404,10 @@ public final class FleetService: @unchecked Sendable {
             }
             do {
                 if let parsed = try FleetHTTPParser.tryParse(next) {
-                    onComplete(parsed.request)
+                    let leftover = next.count > parsed.consumed
+                        ? next.subdata(in: parsed.consumed..<next.count)
+                        : Data()
+                    onComplete(parsed.request, leftover)
                     return
                 }
             } catch {
@@ -273,6 +430,10 @@ public final class FleetService: @unchecked Sendable {
             }
             self.readUntilRequest(connection: connection, buffer: next, cleanup: cleanup, onComplete: onComplete)
         }
+    }
+
+    private final class WeakChannelBox: @unchecked Sendable {
+        weak var channel: FleetWebSocketChannel?
     }
 
     private func peerEndpoint(_ connection: NWConnection) -> (String, UInt16) {

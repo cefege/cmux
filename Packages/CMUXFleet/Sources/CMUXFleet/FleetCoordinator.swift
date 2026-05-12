@@ -36,6 +36,7 @@ public actor FleetCoordinator {
     private var router: FleetRouter?
     private var service: FleetService?
     private var registry: FleetPeerRegistry?
+    private var broadcaster: FleetEventBroadcaster?
     private var boundIP: String?
     private var boundPort: UInt16 = 0
 
@@ -64,6 +65,10 @@ public actor FleetCoordinator {
 
     public func peerStream() async -> AsyncStream<[FleetPeer]>? {
         await registry?.subscribe()
+    }
+
+    public func eventBroadcaster() -> FleetEventBroadcaster? {
+        broadcaster
     }
 
     public func currentIdentity() -> FleetIdentity? {
@@ -100,11 +105,18 @@ public actor FleetCoordinator {
         let router = FleetRouter()
         await registerDefaultRoutes(router: router, identity: identity)
 
+        let broadcaster = FleetEventBroadcaster(hostId: identity.hostId)
+        let endpoint = FleetWebSocketEndpoint(
+            path: "/v1/events",
+            handler: Self.makeEventsHandler(broadcaster: broadcaster)
+        )
+
         let (service, port) = try startServiceOnFirstAvailablePort(
             ipv4: ipv4,
             probe: probe,
             userId: userId,
-            handler: await router.makeHandler()
+            handler: await router.makeHandler(),
+            webSocketEndpoint: endpoint
         )
 
         let registry = FleetPeerRegistry(
@@ -118,6 +130,7 @@ public actor FleetCoordinator {
         self.router = router
         self.service = service
         self.registry = registry
+        self.broadcaster = broadcaster
         self.boundIP = ipv4
         self.boundPort = port
 
@@ -127,13 +140,51 @@ public actor FleetCoordinator {
     public func stop() async {
         let service = self.service
         let registry = self.registry
+        let broadcaster = self.broadcaster
         self.service = nil
         self.registry = nil
         self.router = nil
+        self.broadcaster = nil
         self.boundIP = nil
         self.boundPort = 0
         await registry?.stop()
+        await broadcaster?.shutdown()
         service?.stop()
+    }
+
+    /// Builds the `/v1/events` WS handler. Subscribes the channel to the
+    /// broadcaster and forwards every envelope as a single JSON text frame.
+    /// Returns when the broadcaster ends the subscription or the channel
+    /// receive stream terminates (peer disconnect).
+    private static func makeEventsHandler(broadcaster: FleetEventBroadcaster) -> FleetWebSocketHandler {
+        { channel, _ in
+            let receiveStream = channel.start()
+            let eventStream = await broadcaster.subscribe()
+
+            let receiveTask = Task<Void, Never> {
+                do {
+                    for try await _ in receiveStream {
+                        // Ignore application payloads from the client; pings
+                        // are handled inside the channel.
+                    }
+                } catch {
+                    // receive loop ended on error — outer task will exit on
+                    // the next event yield or via cancellation.
+                }
+            }
+
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            for await envelope in eventStream {
+                guard !Task.isCancelled else { break }
+                guard let data = try? encoder.encode(envelope),
+                      let text = String(data: data, encoding: .utf8)
+                else { continue }
+                if receiveTask.isCancelled { break }
+                channel.sendText(text)
+            }
+            receiveTask.cancel()
+        }
     }
 
     /// Falls back to ephemeral (port 0) only if every preferred port is in
@@ -143,7 +194,8 @@ public actor FleetCoordinator {
         ipv4: String,
         probe: TailscaleProbe,
         userId: Int64,
-        handler: @escaping FleetRequestHandler
+        handler: @escaping FleetRequestHandler,
+        webSocketEndpoint: FleetWebSocketEndpoint?
     ) throws -> (FleetService, UInt16) {
         var attempts: [UInt16] = preferredPorts
         attempts.append(0)
@@ -153,7 +205,8 @@ public actor FleetCoordinator {
                 config: FleetServiceConfig(boundIP: ipv4, port: candidate, version: version),
                 probe: probe,
                 selfUserId: userId,
-                handler: handler
+                handler: handler,
+                webSocketEndpoint: webSocketEndpoint
             )
             do {
                 let port = try service.start()
