@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import Bonsplit
+import CMUXFleet
 import CMUXWorkstream
 import CoreServices
 import UserNotifications
@@ -683,6 +684,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     weak var sidebarSelectionState: SidebarSelectionState?
     var shortcutLayoutCharacterProvider: (UInt16, NSEvent.ModifierFlags) -> String? = KeyboardLayout.character(forKeyCode:modifierFlags:)
     private var workspaceObserver: NSObjectProtocol?
+    var fleetCoordinator: FleetCoordinator?
     private var lifecycleSnapshotObservers: [NSObjectProtocol] = []
     private var windowKeyObservers: [NSObjectProtocol] = []
     private var shortcutMonitor: Any?
@@ -1032,6 +1034,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             setupFeedSidebarUITestIfNeeded()
 #endif
         }
+
+        startFleetCoordinatorIfPossible()
 
         DistributedNotificationCenter.default().addObserver(
             self,
