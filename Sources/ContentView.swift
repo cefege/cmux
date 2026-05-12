@@ -1,5 +1,6 @@
 import AppKit
 import Bonsplit
+import CMUXFleet
 import Combine
 import ImageIO
 import Observation
@@ -9045,6 +9046,10 @@ struct VerticalTabsSidebar: View {
     @State private var terminalScrollBarVisibilityGeneration: UInt64 = 0
     @State private var laidOutWorkspaceRowIds: Set<UUID> = []
     @State private var pendingSelectedWorkspaceScrollId: UUID?
+    @State private var fleetPeers: [FleetPeer] = []
+    @State private var expandedFleetPeerNodeIds: Set<String> = []
+    @State private var fleetWorkspacesByPeerNodeId: [String: [RemoteWorkspace]] = [:]
+    @State private var fleetInFlightFetchNodeIds: Set<String> = []
     @AppStorage(WorkspacePresentationModeSettings.modeKey)
     private var workspacePresentationMode = WorkspacePresentationModeSettings.defaultMode.rawValue
     @AppStorage("sidebarMatchTerminalBackground")
@@ -9362,8 +9367,19 @@ struct VerticalTabsSidebar: View {
         renderContext: WorkspaceListRenderContext,
         minHeight: CGFloat
     ) -> some View {
-        VStack(spacing: 0) {
+        let visibleFleetPeers = fleetPeers.filter { !$0.isSelf }
+        return VStack(spacing: 0) {
             workspaceRows(renderContext: renderContext)
+
+            if !visibleFleetPeers.isEmpty {
+                FleetPeersSection(
+                    peers: visibleFleetPeers,
+                    expandedPeerNodeIds: expandedFleetPeerNodeIds,
+                    workspacesByPeerNodeId: fleetWorkspacesByPeerNodeId,
+                    inFlightFetchNodeIds: fleetInFlightFetchNodeIds,
+                    onTogglePeer: { peer in handleFleetPeerToggle(peer) }
+                )
+            }
 
             SidebarEmptyArea(
                 rowSpacing: tabRowSpacing,
@@ -9377,6 +9393,50 @@ struct VerticalTabsSidebar: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minHeight: minHeight, alignment: .top)
+        .task {
+            await subscribeToFleetPeers()
+        }
+    }
+
+    private func subscribeToFleetPeers() async {
+        var attempts = 0
+        while !Task.isCancelled {
+            if let coordinator = AppDelegate.shared?.fleetCoordinator,
+               let stream = await coordinator.peerStream() {
+                for await peers in stream {
+                    if Task.isCancelled { return }
+                    fleetPeers = peers
+                }
+                return
+            }
+            attempts += 1
+            if attempts > 60 { return }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+    }
+
+    private func handleFleetPeerToggle(_ peer: FleetPeer) {
+        if expandedFleetPeerNodeIds.contains(peer.nodeId) {
+            expandedFleetPeerNodeIds.remove(peer.nodeId)
+            return
+        }
+        expandedFleetPeerNodeIds.insert(peer.nodeId)
+        guard peer.isOnline else { return }
+        guard !fleetInFlightFetchNodeIds.contains(peer.nodeId) else { return }
+        fleetInFlightFetchNodeIds.insert(peer.nodeId)
+        let host = peer.tailscaleIP
+        let port = peer.port
+        let nodeId = peer.nodeId
+        Task {
+            let client = URLSessionFleetClient()
+            do {
+                let response = try await client.workspaces(host: host, port: port, timeout: 5)
+                fleetWorkspacesByPeerNodeId[nodeId] = response.workspaces
+            } catch {
+                fleetWorkspacesByPeerNodeId[nodeId] = nil
+            }
+            fleetInFlightFetchNodeIds.remove(nodeId)
+        }
     }
 
     private func workspaceRows(renderContext: WorkspaceListRenderContext) -> some View {
