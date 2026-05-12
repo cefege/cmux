@@ -115,6 +115,64 @@ final class FleetServiceIntegrationTests: XCTestCase {
     }
 }
 
+final class FleetCoordinatorPeerRegistryTests: XCTestCase {
+    private static let userId: Int64 = 7777
+
+    func testRegistryDiscoversSelfThroughLiveListener() async throws {
+        let selfNode = TailscaleNode(
+            nodeId: "n-self",
+            hostName: "loopback-host",
+            dnsName: "loopback.ts.net.",
+            tailscaleIPs: ["127.0.0.1"],
+            online: true,
+            userId: Self.userId,
+            lastSeenUnix: nil
+        )
+        let status = TailscaleStatus(
+            selfNode: selfNode,
+            peers: [],
+            users: [Self.userId: TailscaleUser(id: Self.userId, loginName: "me", displayName: nil)]
+        )
+        let whois = TailscaleWhois(
+            node: selfNode,
+            user: TailscaleUser(id: Self.userId, loginName: "me", displayName: nil)
+        )
+        let probe = StubTailscaleProbe(stubbedStatus: status, stubbedWhois: whois)
+
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FleetCoordinatorPeerRegistry-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let storage = FleetIdentityFileStorage(fileURL: tempDir.appendingPathComponent("id.json"))
+
+        let coordinator = FleetCoordinator(
+            version: "test",
+            identityStorage: storage,
+            probeFactory: { probe },
+            preferredPorts: [0],
+            peerRegistryConfig: { port in
+                FleetPeerRegistryConfig(pollInterval: 0.1, probeTimeout: 2, port: port)
+            }
+        )
+        _ = try await coordinator.start()
+        defer { Task { await coordinator.stop() } }
+
+        // Give the poll loop at least one tick + the live HTTP round trip.
+        let deadline = Date().addingTimeInterval(3)
+        var peers: [FleetPeer] = []
+        while Date() < deadline {
+            peers = await coordinator.currentPeers()
+            if !peers.isEmpty { break }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+
+        XCTAssertFalse(peers.isEmpty, "registry should have discovered at least self within 3s")
+        let selfPeer = try XCTUnwrap(peers.first { $0.isSelf })
+        XCTAssertTrue(selfPeer.isOnline)
+        XCTAssertEqual(selfPeer.displayName, "loopback-host")
+    }
+}
+
 final class FleetCoordinatorPortFallbackTests: XCTestCase {
     private static let userId: Int64 = 4242
 

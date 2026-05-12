@@ -26,13 +26,16 @@ public enum FleetCoordinatorError: Error, CustomStringConvertible {
 public actor FleetCoordinator {
     private let identityStorage: FleetIdentityStorage
     private let probeFactory: @Sendable () -> TailscaleProbe?
+    private let clientFactory: @Sendable () -> FleetClient
     private let workspaceProvider: FleetWorkspaceProvider
     private let version: String
     private let preferredPorts: [UInt16]
+    private let peerRegistryConfig: (UInt16) -> FleetPeerRegistryConfig
 
     private var identity: FleetIdentity?
     private var router: FleetRouter?
     private var service: FleetService?
+    private var registry: FleetPeerRegistry?
     private var boundIP: String?
     private var boundPort: UInt16 = 0
 
@@ -40,14 +43,27 @@ public actor FleetCoordinator {
         version: String,
         identityStorage: FleetIdentityStorage = FleetIdentityFileStorage(),
         probeFactory: @escaping @Sendable () -> TailscaleProbe? = { TailscaleCLIProbe() },
+        clientFactory: @escaping @Sendable () -> FleetClient = { URLSessionFleetClient() },
         workspaceProvider: FleetWorkspaceProvider = EmptyFleetWorkspaceProvider(),
-        preferredPorts: [UInt16] = Array(FleetPort.multiInstanceRange)
+        preferredPorts: [UInt16] = Array(FleetPort.multiInstanceRange),
+        peerRegistryConfig: @escaping (UInt16) -> FleetPeerRegistryConfig = { FleetPeerRegistryConfig(port: $0) }
     ) {
         self.version = version
         self.identityStorage = identityStorage
         self.probeFactory = probeFactory
+        self.clientFactory = clientFactory
         self.workspaceProvider = workspaceProvider
         self.preferredPorts = preferredPorts
+        self.peerRegistryConfig = peerRegistryConfig
+    }
+
+    public func currentPeers() async -> [FleetPeer] {
+        guard let registry = registry else { return [] }
+        return await registry.snapshot()
+    }
+
+    public func peerStream() async -> AsyncStream<[FleetPeer]>? {
+        await registry?.subscribe()
     }
 
     public func currentIdentity() -> FleetIdentity? {
@@ -91,21 +107,32 @@ public actor FleetCoordinator {
             handler: await router.makeHandler()
         )
 
+        let registry = FleetPeerRegistry(
+            probe: probe,
+            client: clientFactory(),
+            config: peerRegistryConfig(port)
+        )
+        await registry.start()
+
         self.identity = identity
         self.router = router
         self.service = service
+        self.registry = registry
         self.boundIP = ipv4
         self.boundPort = port
 
         return (ipv4, port)
     }
 
-    public func stop() {
+    public func stop() async {
         let service = self.service
+        let registry = self.registry
         self.service = nil
+        self.registry = nil
         self.router = nil
         self.boundIP = nil
         self.boundPort = 0
+        await registry?.stop()
         service?.stop()
     }
 
