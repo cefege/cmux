@@ -9048,8 +9048,7 @@ struct VerticalTabsSidebar: View {
     @State private var pendingSelectedWorkspaceScrollId: UUID?
     @State private var fleetPeers: [FleetPeer] = []
     @State private var expandedFleetPeerNodeIds: Set<String> = []
-    @State private var fleetWorkspacesByPeerNodeId: [String: [RemoteWorkspace]] = [:]
-    @State private var fleetInFlightFetchNodeIds: Set<String> = []
+    @StateObject private var fleetPeerWorkspacesStore = FleetPeerWorkspacesStore()
     @AppStorage(WorkspacePresentationModeSettings.modeKey)
     private var workspacePresentationMode = WorkspacePresentationModeSettings.defaultMode.rawValue
     @AppStorage("sidebarMatchTerminalBackground")
@@ -9368,6 +9367,12 @@ struct VerticalTabsSidebar: View {
         minHeight: CGFloat
     ) -> some View {
         let visibleFleetPeers = fleetPeers.filter { !$0.isSelf }
+        let workspacesByPeerNodeId = fleetPeerWorkspacesStore.workspacesByNodeId
+        let inFlightFetchNodeIds = Set(
+            visibleFleetPeers
+                .filter { $0.isOnline && workspacesByPeerNodeId[$0.nodeId] == nil }
+                .map(\.nodeId)
+        )
         return VStack(spacing: 0) {
             workspaceRows(renderContext: renderContext)
 
@@ -9375,8 +9380,8 @@ struct VerticalTabsSidebar: View {
                 FleetPeersSection(
                     peers: visibleFleetPeers,
                     expandedPeerNodeIds: expandedFleetPeerNodeIds,
-                    workspacesByPeerNodeId: fleetWorkspacesByPeerNodeId,
-                    inFlightFetchNodeIds: fleetInFlightFetchNodeIds,
+                    workspacesByPeerNodeId: workspacesByPeerNodeId,
+                    inFlightFetchNodeIds: inFlightFetchNodeIds,
                     onTogglePeer: { peer in handleFleetPeerToggle(peer) }
                 )
             }
@@ -9406,6 +9411,7 @@ struct VerticalTabsSidebar: View {
                 for await peers in stream {
                     if Task.isCancelled { return }
                     fleetPeers = peers
+                    fleetPeerWorkspacesStore.update(peers: peers)
                 }
                 return
             }
@@ -9418,24 +9424,8 @@ struct VerticalTabsSidebar: View {
     private func handleFleetPeerToggle(_ peer: FleetPeer) {
         if expandedFleetPeerNodeIds.contains(peer.nodeId) {
             expandedFleetPeerNodeIds.remove(peer.nodeId)
-            return
-        }
-        expandedFleetPeerNodeIds.insert(peer.nodeId)
-        guard peer.isOnline else { return }
-        guard !fleetInFlightFetchNodeIds.contains(peer.nodeId) else { return }
-        fleetInFlightFetchNodeIds.insert(peer.nodeId)
-        let host = peer.tailscaleIP
-        let port = peer.port
-        let nodeId = peer.nodeId
-        Task {
-            let client = URLSessionFleetClient()
-            do {
-                let response = try await client.workspaces(host: host, port: port, timeout: 5)
-                fleetWorkspacesByPeerNodeId[nodeId] = response.workspaces
-            } catch {
-                fleetWorkspacesByPeerNodeId[nodeId] = nil
-            }
-            fleetInFlightFetchNodeIds.remove(nodeId)
+        } else {
+            expandedFleetPeerNodeIds.insert(peer.nodeId)
         }
     }
 
