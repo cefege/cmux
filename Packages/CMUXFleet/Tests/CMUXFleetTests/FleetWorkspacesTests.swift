@@ -40,7 +40,6 @@ final class FleetWorkspacesEndpointTests: XCTestCase {
         let hostUuid = UUID(uuidString: "55555555-4444-3333-2222-111111111111")!
         let ws = RemoteWorkspace(
             id: "ws_1",
-            hostId: hostUuid,
             name: "blog-redesign",
             cwd: "/Users/me/code/blog",
             color: "#4c71f2",
@@ -128,7 +127,7 @@ final class FleetWorkspacesEndpointTests: XCTestCase {
             identityStorage: storage,
             probeFactory: { foreignProbe },
             workspaceProvider: StaticFleetWorkspaceProvider([
-                RemoteWorkspace(id: "leaky", hostId: UUID(), name: "should-not-be-readable",
+                RemoteWorkspace(id: "leaky", name: "should-not-be-readable",
                                 cwd: nil, color: nil, lastActiveAtUnix: nil, isAttachedLocally: false)
             ]),
             preferredPorts: [0]

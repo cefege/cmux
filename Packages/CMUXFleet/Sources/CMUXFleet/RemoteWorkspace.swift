@@ -2,10 +2,10 @@ import Foundation
 
 /// Workspace metadata shared between fleet peers. Deliberately small — does
 /// not carry layout, PTY scrollback, or session state. Just enough to render
-/// in the sidebar of another host.
+/// in the sidebar of another host. The owning host id lives on
+/// `FleetWorkspacesResponse`, not duplicated per workspace.
 public struct RemoteWorkspace: Codable, Sendable, Equatable {
     public let id: String
-    public let hostId: UUID
     public let name: String
     public let cwd: String?
     public let color: String?
@@ -14,7 +14,6 @@ public struct RemoteWorkspace: Codable, Sendable, Equatable {
 
     public init(
         id: String,
-        hostId: UUID,
         name: String,
         cwd: String?,
         color: String?,
@@ -22,7 +21,6 @@ public struct RemoteWorkspace: Codable, Sendable, Equatable {
         isAttachedLocally: Bool
     ) {
         self.id = id
-        self.hostId = hostId
         self.name = name
         self.cwd = cwd
         self.color = color

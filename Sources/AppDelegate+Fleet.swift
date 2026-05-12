@@ -11,7 +11,10 @@ private let fleetLogger = Logger(
 extension AppDelegate {
     func startFleetCoordinatorIfPossible() {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0-dev"
-        let coordinator = FleetCoordinator(version: version)
+        let coordinator = FleetCoordinator(
+            version: version,
+            workspaceProvider: CmuxFleetWorkspaceProvider()
+        )
         self.fleetCoordinator = coordinator
         Task.detached(priority: .utility) {
             do {
