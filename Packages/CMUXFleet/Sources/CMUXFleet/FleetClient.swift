@@ -36,6 +36,7 @@ public enum FleetClientError: Error, CustomStringConvertible {
 
 public protocol FleetClient: Sendable {
     func hello(host: String, port: UInt16, timeout: TimeInterval) async throws -> FleetHelloResponse
+    func workspaces(host: String, port: UInt16, timeout: TimeInterval) async throws -> FleetWorkspacesResponse
 }
 
 public struct URLSessionFleetClient: FleetClient {
@@ -46,7 +47,20 @@ public struct URLSessionFleetClient: FleetClient {
     }
 
     public func hello(host: String, port: UInt16, timeout: TimeInterval) async throws -> FleetHelloResponse {
-        guard let url = URL(string: "http://\(host):\(port)/v1/hello") else {
+        try await fetchJSON(host: host, port: port, path: "/v1/hello", timeout: timeout)
+    }
+
+    public func workspaces(host: String, port: UInt16, timeout: TimeInterval) async throws -> FleetWorkspacesResponse {
+        try await fetchJSON(host: host, port: port, path: "/v1/workspaces", timeout: timeout)
+    }
+
+    private func fetchJSON<T: Decodable>(
+        host: String,
+        port: UInt16,
+        path: String,
+        timeout: TimeInterval
+    ) async throws -> T {
+        guard let url = URL(string: "http://\(host):\(port)\(path)") else {
             throw FleetClientError.network("invalid URL")
         }
         var request = URLRequest(url: url)
@@ -71,8 +85,7 @@ public struct URLSessionFleetClient: FleetClient {
         }
 
         do {
-            let decoder = JSONDecoder()
-            return try decoder.decode(FleetHelloResponse.self, from: data)
+            return try JSONDecoder().decode(T.self, from: data)
         } catch {
             throw FleetClientError.malformedResponse(error.localizedDescription)
         }

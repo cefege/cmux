@@ -26,9 +26,17 @@ final class MutableStubProbe: TailscaleProbe, @unchecked Sendable {
 /// registry without spinning up multiple FleetService instances.
 struct FixedFleetClient: FleetClient {
     let responses: [String: FleetHelloResponse]
+    var workspaceResponses: [String: FleetWorkspacesResponse] = [:]
 
     func hello(host: String, port: UInt16, timeout: TimeInterval) async throws -> FleetHelloResponse {
         if let resp = responses[host] {
+            return resp
+        }
+        throw FleetClientError.timeout
+    }
+
+    func workspaces(host: String, port: UInt16, timeout: TimeInterval) async throws -> FleetWorkspacesResponse {
+        if let resp = workspaceResponses[host] {
             return resp
         }
         throw FleetClientError.timeout

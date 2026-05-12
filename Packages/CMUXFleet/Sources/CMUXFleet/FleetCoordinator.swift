@@ -26,6 +26,7 @@ public enum FleetCoordinatorError: Error, CustomStringConvertible {
 public actor FleetCoordinator {
     private let identityStorage: FleetIdentityStorage
     private let probeFactory: @Sendable () -> TailscaleProbe?
+    private let workspaceProvider: FleetWorkspaceProvider
     private let version: String
     private let preferredPorts: [UInt16]
 
@@ -39,11 +40,13 @@ public actor FleetCoordinator {
         version: String,
         identityStorage: FleetIdentityStorage = FleetIdentityFileStorage(),
         probeFactory: @escaping @Sendable () -> TailscaleProbe? = { TailscaleCLIProbe() },
+        workspaceProvider: FleetWorkspaceProvider = EmptyFleetWorkspaceProvider(),
         preferredPorts: [UInt16] = Array(FleetPort.multiInstanceRange)
     ) {
         self.version = version
         self.identityStorage = identityStorage
         self.probeFactory = probeFactory
+        self.workspaceProvider = workspaceProvider
         self.preferredPorts = preferredPorts
     }
 
@@ -147,6 +150,22 @@ public actor FleetCoordinator {
                 "version": v,
             ]
             return .json(200, "OK", payload)
+        }
+
+        let provider = workspaceProvider
+        let hostId = identity.hostId
+        await router.register(method: "GET", path: "/v1/workspaces") { _, _ in
+            let workspaces = await provider.currentWorkspaces()
+            let response = FleetWorkspacesResponse(hostId: hostId, workspaces: workspaces)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            let data = (try? encoder.encode(response)) ?? Data()
+            return FleetHTTPResponse(
+                status: 200,
+                statusText: "OK",
+                headers: ["Content-Type": "application/json; charset=utf-8"],
+                body: data
+            )
         }
     }
 
