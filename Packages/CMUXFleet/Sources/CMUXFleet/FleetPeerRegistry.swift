@@ -1,10 +1,8 @@
 import Foundation
 
 public struct FleetPeer: Sendable, Equatable {
-    /// Tailscale stable node id. The primary key for a peer.
     public let nodeId: String
-    /// Application-level id learned from the peer's /v1/hello. `nil` until the
-    /// first successful probe.
+    /// `nil` until the first successful /v1/hello probe.
     public let hostId: UUID?
     public let displayName: String
     public let tailscaleIP: String
@@ -12,9 +10,9 @@ public struct FleetPeer: Sendable, Equatable {
     public let isOnline: Bool
     public let isSelf: Bool
     public let version: String?
-    /// Unix timestamp of the most recent successful probe.
     public let lastSeenUnix: Int64?
-    /// Unix timestamp of the most recent state transition (online↔offline).
+    /// Bumped only on online↔offline transitions, so subscribers can detect
+    /// state changes without diffing the whole struct.
     public let lastChangedUnix: Int64
 
     public init(
@@ -67,6 +65,10 @@ public actor FleetPeerRegistry {
     private var peers: [String: FleetPeer] = [:]
     private var pollTask: Task<Void, Never>?
     private var subscribers: [UUID: AsyncStream<[FleetPeer]>.Continuation] = [:]
+    private var lastBroadcast: [FleetPeer] = []
+    /// Drop peers offline for this long. Prevents the dict from growing without
+    /// bound across long-lived sessions when peers leave the tailnet for good.
+    private let offlineEvictionUnix: Int64 = 30 * 24 * 60 * 60
 
     public init(
         probe: TailscaleProbe,
@@ -108,13 +110,14 @@ public actor FleetPeerRegistry {
         } catch {
             return
         }
+        if Task.isCancelled { return }
 
         let selfUserId = status.selfNode.userId
         let candidates = ([status.selfNode] + status.peers).filter { node in
             node.online
                 && (node.userId != nil)
                 && (node.userId == selfUserId)
-                && !node.tailscaleIPs.isEmpty
+                && node.tailscaleIPs.contains(where: FleetIPv4.isValid)
         }
 
         let port = config.port
@@ -123,7 +126,7 @@ public actor FleetPeerRegistry {
 
         let probes = await withTaskGroup(of: (TailscaleNode, FleetHelloResponse?).self) { group in
             for node in candidates {
-                guard let ip = node.tailscaleIPs.first(where: { Self.isIPv4($0) }) else { continue }
+                guard let ip = node.tailscaleIPs.first(where: FleetIPv4.isValid) else { continue }
                 let captured = node
                 let client = self.client
                 group.addTask { [client] in
@@ -141,12 +144,13 @@ public actor FleetPeerRegistry {
             }
             return results
         }
+        if Task.isCancelled { return }
 
         let nowUnix = Int64(now().timeIntervalSince1970)
         var seenIds: Set<String> = []
         for (node, hello) in probes {
             seenIds.insert(node.nodeId)
-            guard let ipv4 = node.tailscaleIPs.first(where: { Self.isIPv4($0) }) else { continue }
+            guard let ipv4 = node.tailscaleIPs.first(where: FleetIPv4.isValid) else { continue }
             let previous = peers[node.nodeId]
             let isOnline = hello != nil
             let lastChanged: Int64
@@ -169,7 +173,6 @@ public actor FleetPeerRegistry {
             )
         }
 
-        // Any peer that vanished from the tailnet list becomes offline.
         for (nodeId, peer) in peers where !seenIds.contains(nodeId) && peer.isOnline {
             peers[nodeId] = FleetPeer(
                 nodeId: peer.nodeId,
@@ -185,7 +188,15 @@ public actor FleetPeerRegistry {
             )
         }
 
-        broadcast()
+        evictLongOfflinePeers(now: nowUnix)
+        broadcastIfChanged()
+    }
+
+    private func evictLongOfflinePeers(now nowUnix: Int64) {
+        let cutoff = nowUnix - offlineEvictionUnix
+        peers = peers.filter { _, peer in
+            peer.isOnline || peer.lastChangedUnix >= cutoff
+        }
     }
 
     public func start() {
@@ -208,16 +219,13 @@ public actor FleetPeerRegistry {
         subscribers.removeAll()
     }
 
-    private func broadcast() {
+    private func broadcastIfChanged() {
         let snap = snapshot()
+        if snap == lastBroadcast { return }
+        lastBroadcast = snap
         for (_, continuation) in subscribers {
             continuation.yield(snap)
         }
     }
 
-    private static func isIPv4(_ s: String) -> Bool {
-        let parts = s.split(separator: ".")
-        guard parts.count == 4 else { return false }
-        return parts.allSatisfy { UInt8($0) != nil }
-    }
 }

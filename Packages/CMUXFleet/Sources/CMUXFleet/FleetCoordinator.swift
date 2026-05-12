@@ -27,6 +27,7 @@ public actor FleetCoordinator {
     private let identityStorage: FleetIdentityStorage
     private let probeFactory: @Sendable () -> TailscaleProbe?
     private let version: String
+    private let preferredPorts: [UInt16]
 
     private var identity: FleetIdentity?
     private var router: FleetRouter?
@@ -37,11 +38,13 @@ public actor FleetCoordinator {
     public init(
         version: String,
         identityStorage: FleetIdentityStorage = FleetIdentityFileStorage(),
-        probeFactory: @escaping @Sendable () -> TailscaleProbe? = { TailscaleCLIProbe() }
+        probeFactory: @escaping @Sendable () -> TailscaleProbe? = { TailscaleCLIProbe() },
+        preferredPorts: [UInt16] = Array(FleetPort.multiInstanceRange)
     ) {
         self.version = version
         self.identityStorage = identityStorage
         self.probeFactory = probeFactory
+        self.preferredPorts = preferredPorts
     }
 
     public func currentIdentity() -> FleetIdentity? {
@@ -53,8 +56,6 @@ public actor FleetCoordinator {
         return (ip, boundPort)
     }
 
-    /// Starts the fleet service. Returns the resolved (ip, port) the listener
-    /// is bound to.
     public func start() async throws -> (ip: String, port: UInt16) {
         if service != nil {
             throw FleetCoordinatorError.alreadyRunning
@@ -65,7 +66,7 @@ public actor FleetCoordinator {
         }
 
         let status = try await probe.status()
-        guard let ipv4 = status.selfNode.tailscaleIPs.first(where: { Self.isIPv4($0) }) else {
+        guard let ipv4 = status.selfNode.tailscaleIPs.first(where: FleetIPv4.isValid) else {
             throw FleetCoordinatorError.noTailscaleIPv4
         }
         guard let userId = status.selfNode.userId else {
@@ -80,13 +81,12 @@ public actor FleetCoordinator {
         let router = FleetRouter()
         await registerDefaultRoutes(router: router, identity: identity)
 
-        let service = FleetService(
-            config: FleetServiceConfig(boundIP: ipv4, port: 0, version: version),
+        let (service, port) = try startServiceOnFirstAvailablePort(
+            ipv4: ipv4,
             probe: probe,
-            selfUserId: userId,
+            userId: userId,
             handler: await router.makeHandler()
         )
-        let port = try service.start()
 
         self.identity = identity
         self.router = router
@@ -106,6 +106,37 @@ public actor FleetCoordinator {
         service?.stop()
     }
 
+    /// Falls back to ephemeral (port 0) only if every preferred port is in
+    /// use; peers using FleetPort.default won't find a fallback-bound host,
+    /// which is acceptable for DEV/STAGING side-by-side runs.
+    private func startServiceOnFirstAvailablePort(
+        ipv4: String,
+        probe: TailscaleProbe,
+        userId: Int64,
+        handler: @escaping FleetRequestHandler
+    ) throws -> (FleetService, UInt16) {
+        var attempts: [UInt16] = preferredPorts
+        attempts.append(0)
+        var lastError: Error?
+        for candidate in attempts {
+            let service = FleetService(
+                config: FleetServiceConfig(boundIP: ipv4, port: candidate, version: version),
+                probe: probe,
+                selfUserId: userId,
+                handler: handler
+            )
+            do {
+                let port = try service.start()
+                return (service, port)
+            } catch {
+                lastError = error
+                service.stop()
+                continue
+            }
+        }
+        throw lastError ?? FleetCoordinatorError.tailscaleUnavailable
+    }
+
     private func registerDefaultRoutes(router: FleetRouter, identity: FleetIdentity) async {
         let v = version
         await router.register(method: "GET", path: "/v1/hello") { _, _ in
@@ -119,9 +150,4 @@ public actor FleetCoordinator {
         }
     }
 
-    private static func isIPv4(_ s: String) -> Bool {
-        let parts = s.split(separator: ".")
-        guard parts.count == 4 else { return false }
-        return parts.allSatisfy { UInt8($0) != nil }
-    }
 }

@@ -242,7 +242,7 @@ enum TailscaleWhoisParser {
         guard let nodeDict = root["Node"] as? [String: Any] else {
             throw TailscaleProbeError.malformedOutput("whois missing Node")
         }
-        let node = try TailscaleStatusParser_parseNode(nodeDict)
+        let node = try TailscaleNodeParser.parseFromWhois(nodeDict)
 
         var user: TailscaleUser? = nil
         if let userDict = root["UserProfile"] as? [String: Any],
@@ -256,27 +256,27 @@ enum TailscaleWhoisParser {
     }
 }
 
-/// Re-exposed so the whois parser can use the same node parsing rules without
-/// dropping `parseNode` to file scope.
-internal func TailscaleStatusParser_parseNode(_ dict: [String: Any]) throws -> TailscaleNode {
-    let nodeId = (dict["ID"] as? String) ?? (dict["StableID"] as? String) ?? (dict["PublicKey"] as? String) ?? ""
-    if nodeId.isEmpty {
-        throw TailscaleProbeError.malformedOutput("whois node missing ID")
-    }
-    let hostName = dict["HostName"] as? String ?? (dict["ComputedName"] as? String ?? "")
-    let dnsName = dict["Name"] as? String ?? (dict["DNSName"] as? String ?? "")
-    let ips = (dict["Addresses"] as? [String])?.map { String($0.split(separator: "/").first ?? "") }
-        ?? (dict["TailscaleIPs"] as? [String])
-        ?? []
-    let userId = (dict["User"] as? NSNumber)?.int64Value ?? (dict["UserID"] as? NSNumber)?.int64Value
+enum TailscaleNodeParser {
+    static func parseFromWhois(_ dict: [String: Any]) throws -> TailscaleNode {
+        let nodeId = (dict["ID"] as? String) ?? (dict["StableID"] as? String) ?? (dict["PublicKey"] as? String) ?? ""
+        if nodeId.isEmpty {
+            throw TailscaleProbeError.malformedOutput("whois node missing ID")
+        }
+        let hostName = dict["HostName"] as? String ?? (dict["ComputedName"] as? String ?? "")
+        let dnsName = dict["Name"] as? String ?? (dict["DNSName"] as? String ?? "")
+        let ips = (dict["Addresses"] as? [String])?.map { String($0.split(separator: "/").first ?? "") }
+            ?? (dict["TailscaleIPs"] as? [String])
+            ?? []
+        let userId = (dict["User"] as? NSNumber)?.int64Value ?? (dict["UserID"] as? NSNumber)?.int64Value
 
-    return TailscaleNode(
-        nodeId: nodeId,
-        hostName: hostName,
-        dnsName: dnsName,
-        tailscaleIPs: ips.filter { !$0.isEmpty },
-        online: true,
-        userId: userId,
-        lastSeenUnix: nil
-    )
+        return TailscaleNode(
+            nodeId: nodeId,
+            hostName: hostName,
+            dnsName: dnsName,
+            tailscaleIPs: ips.filter { !$0.isEmpty },
+            online: true,
+            userId: userId,
+            lastSeenUnix: nil
+        )
+    }
 }

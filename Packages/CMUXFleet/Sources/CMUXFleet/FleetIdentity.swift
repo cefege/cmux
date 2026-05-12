@@ -32,17 +32,18 @@ public final class FleetIdentityFileStorage: FleetIdentityStorage {
     }
 
     public convenience init() {
-        let appSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first!.appendingPathComponent("cmux", isDirectory: true)
+        let appSupport = URL.applicationSupportDirectory.appendingPathComponent("cmux", isDirectory: true)
         self.init(fileURL: appSupport.appendingPathComponent("fleet-identity.json"))
     }
 
     public func load() throws -> FleetIdentity? {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: fileURL.path) else { return nil }
-        let data = try Data(contentsOf: fileURL)
+        let data: Data
+        do {
+            data = try Data(contentsOf: fileURL)
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain
+            && error.code == NSFileReadNoSuchFileError {
+            return nil
+        }
         return try JSONDecoder().decode(FleetIdentity.self, from: data)
     }
 
@@ -57,8 +58,8 @@ public final class FleetIdentityFileStorage: FleetIdentityStorage {
 }
 
 public enum FleetIdentityProvider {
-    /// Returns the persisted identity, creating and saving one on first call.
-    /// `defaultDisplayName` is only consulted when generating a new identity.
+    /// `defaultDisplayName` is consulted only on first call (when the
+    /// persisted identity does not yet exist).
     public static func loadOrCreate(
         storage: FleetIdentityStorage,
         defaultDisplayName: @autoclosure () -> String = Host.current().localizedName ?? "Unknown Mac",

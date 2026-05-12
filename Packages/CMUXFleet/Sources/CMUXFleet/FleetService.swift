@@ -57,6 +57,7 @@ public final class FleetService: @unchecked Sendable {
     private var activeConnections: Set<ObjectIdentifier> = []
     private var resolvedPort: UInt16 = 0
     private var startError: Error?
+    private let whoisCache = WhoisCache(ttlSeconds: 60)
 
     public init(
         config: FleetServiceConfig,
@@ -68,7 +69,7 @@ public final class FleetService: @unchecked Sendable {
         self.probe = probe
         self.selfUserId = selfUserId
         self.handler = handler
-        self.queue = DispatchQueue(label: "cmux.fleet.service", qos: .userInitiated)
+        self.queue = DispatchQueue(label: "cmux.fleet.service", qos: .userInitiated, attributes: .concurrent)
     }
 
     public var port: UInt16 {
@@ -211,11 +212,14 @@ public final class FleetService: @unchecked Sendable {
         peerAddress: String,
         peerPort: UInt16
     ) async -> FleetHTTPResponse {
+        let nowUnix = Int64(Date().timeIntervalSince1970)
         let whois: TailscaleWhois?
-        do {
-            whois = try await probe.whois(host: peerAddress, port: peerPort)
-        } catch {
-            whois = nil
+        if let cached = whoisCache.get(key: peerAddress, now: nowUnix) {
+            whois = cached.whois
+        } else {
+            let fresh = try? await probe.whois(host: peerAddress, port: peerPort)
+            whoisCache.set(key: peerAddress, whois: fresh, now: nowUnix)
+            whois = fresh
         }
 
         guard let whois = whois else {
@@ -291,5 +295,31 @@ public final class FleetService: @unchecked Sendable {
         @unknown default:
             return ""
         }
+    }
+}
+
+final class WhoisCache: @unchecked Sendable {
+    struct Entry {
+        let whois: TailscaleWhois?
+        let expiresAtUnix: Int64
+    }
+
+    private let lock = NSLock()
+    private let ttlSeconds: Int64
+    private var entries: [String: Entry] = [:]
+
+    init(ttlSeconds: Int64) {
+        self.ttlSeconds = ttlSeconds
+    }
+
+    func get(key: String, now: Int64) -> Entry? {
+        lock.lock(); defer { lock.unlock() }
+        guard let entry = entries[key], entry.expiresAtUnix > now else { return nil }
+        return entry
+    }
+
+    func set(key: String, whois: TailscaleWhois?, now: Int64) {
+        lock.lock(); defer { lock.unlock() }
+        entries[key] = Entry(whois: whois, expiresAtUnix: now + ttlSeconds)
     }
 }

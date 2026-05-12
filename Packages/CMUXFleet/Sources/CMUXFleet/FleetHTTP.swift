@@ -61,7 +61,7 @@ public enum FleetHTTPParser {
     /// - Throws: `FleetHTTPParseError.malformed` if the buffer is clearly invalid.
     public static func tryParse(_ buffer: Data) throws -> (request: FleetHTTPRequest, consumed: Int)? {
         let crlfcrlf = Data([0x0D, 0x0A, 0x0D, 0x0A])
-        guard let headerEnd = range(of: crlfcrlf, in: buffer) else {
+        guard let headerEnd = buffer.range(of: crlfcrlf) else {
             return nil
         }
         let headerBytes = buffer.subdata(in: 0..<headerEnd.lowerBound)
@@ -130,13 +130,4 @@ public enum FleetHTTPParser {
         return out
     }
 
-    private static func range(of needle: Data, in haystack: Data) -> Range<Int>? {
-        guard !needle.isEmpty, haystack.count >= needle.count else { return nil }
-        for i in 0...(haystack.count - needle.count) {
-            if haystack.subdata(in: i..<(i + needle.count)) == needle {
-                return i..<(i + needle.count)
-            }
-        }
-        return nil
-    }
 }

@@ -35,6 +35,20 @@ struct FixedFleetClient: FleetClient {
     }
 }
 
+/// Monotonically increasing clock injected into FleetPeerRegistry tests so
+/// `lastChangedUnix` checks see distinct values between ticks when state moves.
+final class NowCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var current: Int64
+    init(start: Int64) { self.current = start }
+    @Sendable func next() -> Date {
+        lock.lock(); defer { lock.unlock() }
+        let value = current
+        current += 1
+        return Date(timeIntervalSince1970: TimeInterval(value))
+    }
+}
+
 final class FleetPeerRegistryTests: XCTestCase {
     private static let userId: Int64 = 1234
 
@@ -177,6 +191,41 @@ final class FleetPeerRegistryTests: XCTestCase {
         let entry = try XCTUnwrap(after.first { $0.nodeId == "n-peer" })
         XCTAssertFalse(entry.isOnline)
         XCTAssertEqual(entry.displayName, "peer", "display name should be retained for greyed-out peer")
+    }
+
+    func testIdenticalTickDoesNotChangeLastChanged() async throws {
+        let me = makeNode(nodeId: "n-me", hostName: "me", ip: "100.0.0.1")
+        let probe = MutableStubProbe(
+            status: makeStatus(self: me, peers: []),
+            whois: nil
+        )
+        let hello = FleetHelloResponse(
+            schemaVersion: 1,
+            hostId: UUID(),
+            displayName: "me",
+            version: "1.0"
+        )
+        let client = FixedFleetClient(responses: ["100.0.0.1": hello])
+
+        let counter = NowCounter(start: 1_700_000_000)
+        let registry = FleetPeerRegistry(
+            probe: probe,
+            client: client,
+            config: FleetPeerRegistryConfig(pollInterval: 60, probeTimeout: 1),
+            now: counter.next
+        )
+
+        await registry.tick()
+        let firstSnap = await registry.snapshot()
+        let first = try XCTUnwrap(firstSnap.first)
+        let firstChanged = first.lastChangedUnix
+
+        await registry.tick()
+        let secondSnap = await registry.snapshot()
+        let second = try XCTUnwrap(secondSnap.first)
+
+        XCTAssertEqual(second.lastChangedUnix, firstChanged,
+                       "lastChangedUnix must not move when state is unchanged")
     }
 
     func testSubscriberReceivesUpdates() async throws {

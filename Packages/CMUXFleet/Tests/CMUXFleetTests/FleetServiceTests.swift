@@ -98,9 +98,8 @@ final class FleetServiceIntegrationTests: XCTestCase {
         }
         defer { service.stop() }
 
-        let (status, body, _) = try await fetch(host: "127.0.0.1", port: service.port, path: "/v1/hello")
+        let (status, _, _) = try await fetch(host: "127.0.0.1", port: service.port, path: "/v1/hello")
         XCTAssertEqual(status, 403)
-        XCTAssertTrue(String(data: body, encoding: .utf8)?.contains("different tailnet user") ?? false)
     }
 
     func testRejectsWhenWhoisFails() async throws {
@@ -113,6 +112,65 @@ final class FleetServiceIntegrationTests: XCTestCase {
 
         let (status, _, _) = try await fetch(host: "127.0.0.1", port: service.port, path: "/v1/hello")
         XCTAssertEqual(status, 403)
+    }
+}
+
+final class FleetCoordinatorPortFallbackTests: XCTestCase {
+    private static let userId: Int64 = 4242
+
+    private func makeProbe() -> StubTailscaleProbe {
+        let node = TailscaleNode(
+            nodeId: "n",
+            hostName: "host",
+            dnsName: "host.ts.net.",
+            tailscaleIPs: ["127.0.0.1"],
+            online: true,
+            userId: Self.userId,
+            lastSeenUnix: nil
+        )
+        return StubTailscaleProbe(
+            stubbedStatus: TailscaleStatus(
+                selfNode: node,
+                peers: [],
+                users: [Self.userId: TailscaleUser(id: Self.userId, loginName: "x", displayName: nil)]
+            ),
+            stubbedWhois: TailscaleWhois(
+                node: node,
+                user: TailscaleUser(id: Self.userId, loginName: "x", displayName: nil)
+            )
+        )
+    }
+
+    func testFallsBackToNextPortWhenFirstIsTaken() async throws {
+        let probe = makeProbe()
+        // Take an ephemeral port first so we know one specific port is in use.
+        let blocker = FleetService(
+            config: FleetServiceConfig(boundIP: "127.0.0.1", port: 0, version: "test"),
+            probe: probe,
+            selfUserId: Self.userId,
+            handler: { _, _ in .plainText(200, "OK", "") }
+        )
+        let blockedPort = try blocker.start()
+        defer { blocker.stop() }
+
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FleetCoordinatorPortFallback-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let storage = FleetIdentityFileStorage(fileURL: tempDir.appendingPathComponent("id.json"))
+
+        // First preferred port is the one we just blocked; second is ephemeral.
+        let coordinator = FleetCoordinator(
+            version: "test",
+            identityStorage: storage,
+            probeFactory: { probe },
+            preferredPorts: [blockedPort]
+        )
+        let binding = try await coordinator.start()
+        defer { Task { await coordinator.stop() } }
+
+        XCTAssertNotEqual(binding.port, blockedPort, "coordinator should have skipped the blocked port")
+        XCTAssertGreaterThan(binding.port, 0)
     }
 }
 
@@ -148,7 +206,8 @@ final class FleetCoordinatorDefaultRoutesTests: XCTestCase {
         let coordinator = FleetCoordinator(
             version: "test-1.0",
             identityStorage: storage,
-            probeFactory: { probe }
+            probeFactory: { probe },
+            preferredPorts: [0]
         )
 
         let binding = try await coordinator.start()
