@@ -23,6 +23,7 @@ extension AppDelegate {
 #if DEBUG
                 cmuxDebugLog("fleet.start ip=\(binding.ip) port=\(binding.port)")
 #endif
+                await Self.attachWorkspaceEventBridge(coordinator: coordinator)
                 if let stream = await coordinator.peerStream() {
                     for await peers in stream {
                         let online = peers.filter { $0.isOnline }.count
@@ -40,5 +41,31 @@ extension AppDelegate {
 #endif
             }
         }
+    }
+
+    /// Polls `AppDelegate.shared?.tabManager` until it's been configured by
+    /// the app boot path, then mounts the bridge so workspace lifecycle
+    /// changes get fanned out to subscribed peers.
+    private static func attachWorkspaceEventBridge(coordinator: FleetCoordinator) async {
+        guard let broadcaster = await coordinator.eventBroadcaster() else { return }
+        for _ in 0..<60 {
+            if Task.isCancelled { return }
+            let attached = await MainActor.run { () -> Bool in
+                guard AppDelegate.shared?.fleetWorkspaceEventBridge == nil,
+                      let tm = AppDelegate.shared?.tabManager else { return false }
+                let bridge = FleetWorkspaceEventBridge(broadcaster: broadcaster, tabManager: tm)
+                bridge.start()
+                AppDelegate.shared?.fleetWorkspaceEventBridge = bridge
+#if DEBUG
+                cmuxDebugLog("fleet.eventBridge.started workspaces=\(tm.tabs.count)")
+#endif
+                return true
+            }
+            if attached { return }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+#if DEBUG
+        cmuxDebugLog("fleet.eventBridge.timeout no tabManager after 60s")
+#endif
     }
 }
