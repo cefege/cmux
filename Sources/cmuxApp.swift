@@ -372,6 +372,9 @@ struct cmuxApp: App {
                     ) {
                         FeedButtonStyleDebugWindowController.shared.show()
                     }
+                    Button("Fleet Peer Attach…") {
+                        PeerAttachWindowController.shared.show()
+                    }
                     Button(
                         String(
                             localized: "debug.menu.startupAppearanceDebug",
