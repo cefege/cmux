@@ -13,7 +13,8 @@ extension AppDelegate {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0-dev"
         let coordinator = FleetCoordinator(
             version: version,
-            workspaceProvider: CmuxFleetWorkspaceProvider()
+            workspaceProvider: CmuxFleetWorkspaceProvider(),
+            attachProvider: LocalManualPtyAttachProvider()
         )
         self.fleetCoordinator = coordinator
         Task.detached(priority: .utility) {

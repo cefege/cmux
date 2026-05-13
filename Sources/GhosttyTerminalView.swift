@@ -4643,6 +4643,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// released when the surface or PTY tears down. Non-nil only while
     /// `manualPty` is non-nil and Ghostty is holding it as `io_write_userdata`.
     private var manualPtyWriteUserdata: UnsafeMutableRawPointer?
+    /// Fan-out wrapper around the manual PTY's single output handler slot.
+    /// Owns Ghostty's `ghostty_surface_process_output` call as the primary
+    /// handler and lets remote attach viewers tap the byte stream as
+    /// secondary subscribers. Registered into the shared
+    /// `LocalManualPtyRegistry` keyed by `tabId` while the surface is live.
+    private var manualPtyBroadcast: ManualPtyOutputBroadcast?
     /// The desired focus state for the Ghostty C surface. May be set before the
     /// C surface exists (e.g. during layout restoration); `createSurface`
     /// reapplies this value once the runtime surface exists, then keeps using it
@@ -5051,6 +5057,21 @@ final class TerminalSurface: Identifiable, ObservableObject {
     /// Ghostty surface is freed so the read handler can't dispatch into a
     /// freed surface. Idempotent.
     private func tearDownManualPtyIfNeeded() {
+        if let broadcast = manualPtyBroadcast {
+            let workspaceId = tabId
+            Task.detached {
+                await LocalManualPtyRegistry.shared.unregister(
+                    workspaceId: workspaceId,
+                    broadcast: broadcast
+                )
+#if DEBUG
+                cmuxDebugLog(
+                    "fleet.manualPty.attach.unregister workspace=\(workspaceId.uuidString.prefix(5))"
+                )
+#endif
+            }
+            manualPtyBroadcast = nil
+        }
         guard let pty = manualPty else {
             if let userdata = manualPtyWriteUserdata {
                 Unmanaged<CmuxPTY>.fromOpaque(userdata).release()
@@ -5640,10 +5661,31 @@ final class TerminalSurface: Identifiable, ObservableObject {
         // abnormal-exit heuristic for free.
         if let pty = manualPty {
             let surfaceForCallback = createdSurface
-            pty.setOutputHandler { chunk in
+            // Wrap the output handler in a broadcast so the local renderer
+            // and any remote attach viewers can all observe the stream.
+            // The broadcast itself is the single handler we hand to
+            // CmuxPTY; primary + subscribers fan out from there.
+            let broadcast = ManualPtyOutputBroadcast()
+            broadcast.setPrimary { chunk in
                 guard let base = chunk.baseAddress?.assumingMemoryBound(to: CChar.self),
                       !chunk.isEmpty else { return }
                 ghostty_surface_process_output(surfaceForCallback, base, UInt(chunk.count))
+            }
+            manualPtyBroadcast = broadcast
+            let workspaceId = tabId
+            Task.detached {
+                await LocalManualPtyRegistry.shared.register(
+                    workspaceId: workspaceId,
+                    broadcast: broadcast
+                )
+#if DEBUG
+                cmuxDebugLog(
+                    "fleet.manualPty.attach.register workspace=\(workspaceId.uuidString.prefix(5))"
+                )
+#endif
+            }
+            pty.setOutputHandler { chunk in
+                broadcast.dispatch(chunk)
             }
             let surfaceId = id
             let spawnedAt = pty.spawnedAt
