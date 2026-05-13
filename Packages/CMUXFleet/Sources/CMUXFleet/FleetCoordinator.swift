@@ -28,6 +28,7 @@ public actor FleetCoordinator {
     private let probeFactory: @Sendable () -> TailscaleProbe?
     private let clientFactory: @Sendable () -> FleetClient
     private let workspaceProvider: FleetWorkspaceProvider
+    private let attachProvider: WorkspaceAttachProvider
     private let version: String
     private let preferredPorts: [UInt16]
     private let peerRegistryConfig: (UInt16) -> FleetPeerRegistryConfig
@@ -46,6 +47,7 @@ public actor FleetCoordinator {
         probeFactory: @escaping @Sendable () -> TailscaleProbe? = { TailscaleCLIProbe() },
         clientFactory: @escaping @Sendable () -> FleetClient = { URLSessionFleetClient() },
         workspaceProvider: FleetWorkspaceProvider = EmptyFleetWorkspaceProvider(),
+        attachProvider: WorkspaceAttachProvider = NoopWorkspaceAttachProvider(),
         preferredPorts: [UInt16] = Array(FleetPort.multiInstanceRange),
         peerRegistryConfig: @escaping (UInt16) -> FleetPeerRegistryConfig = { FleetPeerRegistryConfig(port: $0) }
     ) {
@@ -54,6 +56,7 @@ public actor FleetCoordinator {
         self.probeFactory = probeFactory
         self.clientFactory = clientFactory
         self.workspaceProvider = workspaceProvider
+        self.attachProvider = attachProvider
         self.preferredPorts = preferredPorts
         self.peerRegistryConfig = peerRegistryConfig
     }
@@ -112,7 +115,7 @@ public actor FleetCoordinator {
         )
         let attachEndpoint = FleetWebSocketEndpoint.template(
             "/v1/workspaces/{id}/attach",
-            handler: Self.makeAttachStubHandler()
+            handler: Self.makeAttachHandler(provider: attachProvider)
         )
 
         let (service, port) = try startServiceOnFirstAvailablePort(
@@ -191,39 +194,79 @@ public actor FleetCoordinator {
         }
     }
 
-    /// Step 6a scaffold for `/v1/workspaces/{id}/attach`. The full handler
-    /// will tee the local manual PTY's output to this channel and inject
-    /// frames received from the peer back as input. For now we acknowledge
-    /// the connection with a single JSON hello and close — enough to verify
-    /// path-template routing and to give clients a stable response shape.
-    private static func makeAttachStubHandler() -> FleetWebSocketHandler {
+    /// Step 6 attach handler. Looks the workspace id out of `pathParams`,
+    /// asks the host's `WorkspaceAttachProvider` to subscribe to the local
+    /// manual PTY's output, and fans the bytes to the peer as one
+    /// `{"type":"out","data":<base64>}` text frame per chunk. Sends
+    /// `{"type":"attach_hello",...}` first so clients have a known
+    /// handshake marker. On unknown workspace id or noop provider the
+    /// peer gets `{"type":"not_found","workspaceId":...}` and the
+    /// channel closes.
+    ///
+    /// Input frames from the peer aren't forwarded yet — the protocol is
+    /// output-only in this slice. Bidirectional flow lands once the host
+    /// exposes an input sink alongside the output subscription.
+    private static func makeAttachHandler(provider: WorkspaceAttachProvider) -> FleetWebSocketHandler {
         { channel, ctx in
             let workspaceId = ctx.pathParams["id"] ?? ""
-            let payload: [String: Any] = [
+
+            let subscription = await provider.subscribe(workspaceId: workspaceId) { chunk in
+                let payload: [String: Any] = [
+                    "type": "out",
+                    "data": chunk.base64EncodedString(),
+                ]
+                guard
+                    let data = try? JSONSerialization.data(
+                        withJSONObject: payload,
+                        options: [.sortedKeys]
+                    ),
+                    let text = String(data: data, encoding: .utf8)
+                else { return }
+                channel.sendText(text)
+            }
+
+            guard let subscription else {
+                let payload: [String: Any] = [
+                    "type": "not_found",
+                    "workspaceId": workspaceId,
+                ]
+                if let data = try? JSONSerialization.data(
+                    withJSONObject: payload,
+                    options: [.sortedKeys]
+                ), let text = String(data: data, encoding: .utf8) {
+                    channel.sendText(text)
+                }
+                channel.close(code: 1000, reason: "workspace not found")
+                return
+            }
+
+            let hello: [String: Any] = [
                 "type": "attach_hello",
                 "workspaceId": workspaceId,
-                "status": "stub",
             ]
             if let data = try? JSONSerialization.data(
-                withJSONObject: payload,
+                withJSONObject: hello,
                 options: [.sortedKeys]
             ), let text = String(data: data, encoding: .utf8) {
                 channel.sendText(text)
             }
-            // Drain any frames the client sends before closing so the receive
-            // loop can shut down cleanly. The stub doesn't process input yet.
+
+            // Keep the channel open until the peer disconnects. The receive
+            // loop just drains frames (input handling is a later slice);
+            // when it ends we tear down the subscription so the host stops
+            // forwarding bytes.
             let receiveStream = channel.start()
             do {
                 for try await _ in receiveStream {
-                    // Discard the first frame; the stub doesn't process input
-                    // yet and the outer task closes the channel immediately
-                    // after this iteration.
-                    break
+                    // Input frames are ignored until bidirectional support
+                    // lands; the iteration still keeps the connection alive.
                 }
             } catch {
-                // Receive errored — channel is being torn down. Nothing to do.
+                // Receive errored — peer dropped or framing broke. Fall
+                // through to subscription cleanup + channel close.
             }
-            channel.close(code: 1000, reason: "attach stub")
+            subscription.close()
+            channel.close(code: 1000, reason: "attach complete")
         }
     }
 
