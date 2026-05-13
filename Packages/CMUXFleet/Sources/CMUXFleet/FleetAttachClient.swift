@@ -35,21 +35,25 @@ public protocol FleetAttachClient: Sendable {
 public final class FleetAttachSession: @unchecked Sendable {
     public let workspaceId: String
     public let events: AsyncThrowingStream<FleetAttachEvent, Error>
-    private let task: URLSessionWebSocketTask
-    private let consumer: Task<Void, Never>
+    private let sendTextHandler: @Sendable (String) async throws -> Void
+    private let closeHandler: @Sendable () -> Void
     private let lock = NSLock()
     private var didClose = false
 
-    fileprivate init(
+    /// Generic init used by both URLSession-based and NWConnection-based
+    /// clients. The transport-specific bits collapse into two closures so
+    /// `FleetAttachSession` doesn't know whether it's running on
+    /// `URLSessionWebSocketTask` or a raw `NWConnection`.
+    init(
         workspaceId: String,
-        task: URLSessionWebSocketTask,
         events: AsyncThrowingStream<FleetAttachEvent, Error>,
-        consumer: Task<Void, Never>
+        sendText: @escaping @Sendable (String) async throws -> Void,
+        close: @escaping @Sendable () -> Void
     ) {
         self.workspaceId = workspaceId
-        self.task = task
         self.events = events
-        self.consumer = consumer
+        self.sendTextHandler = sendText
+        self.closeHandler = close
     }
 
     /// Forward typing from the local UI to the host's PTY. Bytes are
@@ -82,8 +86,7 @@ public final class FleetAttachSession: @unchecked Sendable {
         didClose = true
         lock.unlock()
         if already { return }
-        consumer.cancel()
-        task.cancel(with: .goingAway, reason: nil)
+        closeHandler()
     }
 
     deinit { close() }
@@ -96,7 +99,7 @@ public final class FleetAttachSession: @unchecked Sendable {
     private func sendJSON(_ payload: [String: Any]) async throws {
         let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
         let text = String(data: data, encoding: .utf8) ?? "{}"
-        try await task.send(.string(text))
+        try await sendTextHandler(text)
     }
 }
 
@@ -154,9 +157,14 @@ public struct URLSessionFleetAttachClient: FleetAttachClient {
 
         return FleetAttachSession(
             workspaceId: workspaceId,
-            task: task,
             events: stream,
-            consumer: consumer
+            sendText: { @Sendable text in
+                try await task.send(.string(text))
+            },
+            close: { @Sendable in
+                consumer.cancel()
+                task.cancel(with: .goingAway, reason: nil)
+            }
         )
     }
 

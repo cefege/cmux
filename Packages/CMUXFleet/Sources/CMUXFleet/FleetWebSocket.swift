@@ -120,6 +120,73 @@ public enum FleetWebSocket {
         ))
     }
 
+    /// Encodes a client→server frame with the mandatory 32-bit masking key
+    /// (RFC 6455 §5.3). The mask is randomized per frame; the helper accepts
+    /// an explicit key for deterministic tests.
+    public static func encodeMasked(
+        _ frame: FleetWebSocketFrame,
+        maskingKey: [UInt8]? = nil
+    ) -> Data {
+        let mask: [UInt8]
+        if let maskingKey, maskingKey.count == 4 {
+            mask = maskingKey
+        } else {
+            var generator = SystemRandomNumberGenerator()
+            mask = (0..<4).map { _ in UInt8.random(in: 0...UInt8.max, using: &generator) }
+        }
+
+        var out = Data()
+        let finBit: UInt8 = frame.isFinal ? 0x80 : 0x00
+        out.append(finBit | (frame.opcode.rawValue & 0x0F))
+
+        let length = frame.payload.count
+        let maskBit: UInt8 = 0x80
+        if length < 126 {
+            out.append(maskBit | UInt8(length))
+        } else if length <= Int(UInt16.max) {
+            out.append(maskBit | 126)
+            out.append(UInt8((length >> 8) & 0xFF))
+            out.append(UInt8(length & 0xFF))
+        } else {
+            out.append(maskBit | 127)
+            let wide = UInt64(length)
+            for shift in stride(from: 56, through: 0, by: -8) {
+                out.append(UInt8((wide >> shift) & 0xFF))
+            }
+        }
+        out.append(contentsOf: mask)
+        var masked = Data(count: length)
+        frame.payload.withUnsafeBytes { src in
+            masked.withUnsafeMutableBytes { dst in
+                guard let s = src.baseAddress, let d = dst.baseAddress else { return }
+                for i in 0..<length {
+                    d.advanced(by: i).storeBytes(
+                        of: s.load(fromByteOffset: i, as: UInt8.self) ^ mask[i % 4],
+                        as: UInt8.self
+                    )
+                }
+            }
+        }
+        out.append(masked)
+        return out
+    }
+
+    public static func encodeMaskedText(_ text: String, isFinal: Bool = true) -> Data {
+        encodeMasked(FleetWebSocketFrame(
+            isFinal: isFinal,
+            opcode: .text,
+            payload: Data(text.utf8)
+        ))
+    }
+
+    /// Generate a 16-byte random Sec-WebSocket-Key (base64). Per RFC 6455
+    /// §4.1; the server echoes its SHA1-based hash as Sec-WebSocket-Accept.
+    public static func randomClientKey() -> String {
+        var generator = SystemRandomNumberGenerator()
+        let bytes = (0..<16).map { _ in UInt8.random(in: 0...UInt8.max, using: &generator) }
+        return Data(bytes).base64EncodedString()
+    }
+
     public static func encodePing(payload: Data = Data()) -> Data {
         encode(FleetWebSocketFrame(isFinal: true, opcode: .ping, payload: payload))
     }

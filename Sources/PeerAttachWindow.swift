@@ -27,9 +27,13 @@ final class PeerAttachViewModel: ObservableObject {
 
     private var session: FleetAttachSession?
     private var consumer: Task<Void, Never>?
-    private let attachClient: FleetAttachClient = URLSessionFleetAttachClient(
-        session: URLSession(configuration: .ephemeral)
-    )
+    // Tailscale CGNAT IPs (and even MagicDNS .ts.net names in some macOS
+    // configurations) get bounced by ATS even with NSExceptionDomains
+    // entries. NWFleetAttachClient talks raw NWConnection so ATS never
+    // gets to see the URL. The HTTP /v1/workspaces probe still goes
+    // through URLSession (covered by the ts.net exception) — if that
+    // turns out to also fail we'll port it to NWConnection too.
+    private let attachClient: FleetAttachClient = NWFleetAttachClient()
     private let httpClient: FleetClient = URLSessionFleetClient(
         session: URLSession(configuration: .ephemeral)
     )
