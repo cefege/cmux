@@ -4488,6 +4488,20 @@ private enum FleetManualPtyLaunch {
     }
 }
 
+/// Map CmuxPTYExitStatus into the uint32 exit_code that Ghostty's
+/// Surface.childExited expects. Mirrors POSIX/sh convention so the
+/// renderer's "abnormal exit" heuristic behaves the same as in EXEC mode.
+private func manualPtyExitCodeForGhostty(_ status: CmuxPTYExitStatus) -> UInt32 {
+    switch status.reason {
+    case .exited(let code):
+        return UInt32(truncatingIfNeeded: code) & 0xFF
+    case .signaled(let signal):
+        return UInt32(128 &+ (signal & 0x7F))
+    case .unknown:
+        return UInt32(UInt8.max)
+    }
+}
+
 final class TerminalSurface: Identifiable, ObservableObject {
     final class SearchState: ObservableObject {
         @Published var needle: String
@@ -5576,12 +5590,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
             lastYScale = scaleFactors.y
         }
 
-        // Fleet step 5.5B: once Ghostty's surface exists and has been sized,
-        // wire the manual PTY's bytes into Ghostty's renderer, push the
-        // child-grid winsize, and request close on child exit. waitAfterCommand
-        // parity (showing "[process exited]" and keeping the surface live) is
-        // 5.5C work — for now the toggle is experimental and a quick close on
-        // exit is acceptable behaviour.
+        // Fleet step 5.5B/C: once Ghostty's surface exists and has been
+        // sized, wire the manual PTY's bytes into Ghostty's renderer, push
+        // the child-grid winsize, and route child exit through the same
+        // Surface.childExited path the exec backend uses. That gets us the
+        // "Process exited" banner, wait_after_command parity, and the
+        // abnormal-exit heuristic for free.
         if let pty = manualPty {
             let surfaceForCallback = createdSurface
             pty.setOutputHandler { chunk in
@@ -5590,11 +5604,14 @@ final class TerminalSurface: Identifiable, ObservableObject {
                 ghostty_surface_process_output(surfaceForCallback, base, UInt(chunk.count))
             }
             let surfaceId = id
-            pty.setExitHandler { _ in
+            let spawnedAt = pty.spawnedAt
+            pty.setExitHandler { status in
                 // Surface may already be freed by the time main runs the
-                // close request. Check the registry to confirm the surface
+                // notification. Check the registry to confirm the surface
                 // pointer is still owned by the same TerminalSurface id —
-                // otherwise the surface is gone and request_close would UAF.
+                // otherwise the surface is gone and we'd UAF.
+                let exitCode = manualPtyExitCodeForGhostty(status)
+                let elapsedMs = max(0, UInt64(Date().timeIntervalSince(spawnedAt) * 1000))
                 Task { @MainActor in
                     guard TerminalSurfaceRegistry.shared.runtimeSurfaceOwnerId(surfaceForCallback) == surfaceId else {
 #if DEBUG
@@ -5603,9 +5620,12 @@ final class TerminalSurface: Identifiable, ObservableObject {
                         return
                     }
 #if DEBUG
-                    cmuxDebugLog("fleet.manualPty.exit surface=\(surfaceId.uuidString.prefix(5))")
+                    cmuxDebugLog(
+                        "fleet.manualPty.exit surface=\(surfaceId.uuidString.prefix(5)) " +
+                        "code=\(exitCode) runtime_ms=\(elapsedMs)"
+                    )
 #endif
-                    ghostty_surface_request_close(surfaceForCallback)
+                    ghostty_surface_notify_child_exited(surfaceForCallback, exitCode, elapsedMs)
                 }
             }
             applyManualPtyWinsizeFromSurface(createdSurface)

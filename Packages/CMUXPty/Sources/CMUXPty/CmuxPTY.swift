@@ -8,6 +8,10 @@ public final class CmuxPTY: @unchecked Sendable {
 
     public let masterFD: Int32
     public let childPID: pid_t
+    /// Wall-clock time of the successful forkpty() that produced this PTY.
+    /// Used by callers to compute the child's runtime when reporting exit
+    /// back into renderers that distinguish abnormal (early) exits.
+    public let spawnedAt: Date
 
     private let stateQueue = DispatchQueue(label: "com.cmux.pty.state", qos: .userInitiated)
     private var readSource: DispatchSourceRead?
@@ -16,9 +20,10 @@ public final class CmuxPTY: @unchecked Sendable {
     private var exitHandler: ExitHandler?
     private var isClosed = false
 
-    private init(masterFD: Int32, childPID: pid_t) {
+    private init(masterFD: Int32, childPID: pid_t, spawnedAt: Date) {
         self.masterFD = masterFD
         self.childPID = childPID
+        self.spawnedAt = spawnedAt
     }
 
     /// Open a new pseudo-terminal master, fork+execve the configured command,
@@ -152,7 +157,7 @@ public final class CmuxPTY: @unchecked Sendable {
             throw CmuxPTYError.execFailed(errno: childErrno)
         }
 
-        return CmuxPTY(masterFD: masterFD, childPID: pid)
+        return CmuxPTY(masterFD: masterFD, childPID: pid, spawnedAt: Date())
     }
 
     /// Install a closure to be invoked with each chunk read from the master fd.

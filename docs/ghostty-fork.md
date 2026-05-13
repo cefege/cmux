@@ -173,6 +173,28 @@ tend to conflict together during rebases.
     render-now C API, or output C API. Upstream already has internal
     `Termio.processOutput`, so prefer an upstream C bridge if one lands.
 
+### 11a) Manual-IO child-exit notification
+
+- Commit: `fe42329c2` (Expose manual-IO child-exit notification API)
+- Branch on `cefege/ghostty`: `cmux-manual-io-child-exited` (push to
+  `manaflow-ai/ghostty` blocked on access; bump the submodule URL when the
+  branch lands upstream).
+- Files:
+  - `include/ghostty.h`
+  - `src/Surface.zig`
+  - `src/apprt/embedded.zig`
+- Summary:
+  - Adds `ghostty_surface_notify_child_exited(surface, exit_code, runtime_ms)`
+    so embedders that own the PTY (manual IO backend) can drive the same
+    `Surface.childExited` path that the exec backend hits internally.
+  - Exposes `Surface.notifyChildExited` as a thin public wrapper over the
+    private `childExited` so the new C export has something to call.
+  - Lets cmux's fleet step 5.5 reuse upstream's `wait_after_command`
+    handling, the "Process exited. Press any key to close the terminal."
+    banner, and the abnormal-exit heuristic without re-implementing any
+    of it on the embedder side.
+  - Delete when upstream exposes an equivalent embedder entry point.
+
 ### 11) Metal renderer preedit row rebuild guard
 
 - Commits:
