@@ -92,36 +92,75 @@ final class PeerAttachViewModel: ObservableObject {
         }
     }
 
-    /// Hit `/v1/workspaces` on the peer and populate `availableWorkspaces`
-    /// so the user can pick instead of typing a UUID. Tailnet auth still
-    /// applies — the host will return 403 if Tailscale isn't aligned.
+    /// Probe the multi-instance fleet port range on the entered host
+    /// until one answers `/v1/hello`, then fetch `/v1/workspaces` from
+    /// that port. Auto-fills `port` with whatever responded so the user
+    /// doesn't need to know which slot the peer's cmux landed on
+    /// (14242 if first instance, 14243 if there was a conflict, etc).
+    /// Tailnet auth still applies — a foreign-tailnet peer returns 403.
     func listWorkspaces() {
         let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedHost.isEmpty,
-              let portValue = UInt16(port.trimmingCharacters(in: .whitespacesAndNewlines)),
-              portValue > 0
-        else {
-            listStatus = "Need host + port"
+        guard !trimmedHost.isEmpty else {
+            listStatus = "Need host"
             return
         }
-        listStatus = "Listing…"
-        let client = httpClient
+        let candidatePorts: [UInt16]
+        if let preferred = UInt16(port.trimmingCharacters(in: .whitespacesAndNewlines)),
+           preferred > 0
+        {
+            // Try the manual entry first, then fall back across the
+            // multi-instance range so a "wrong port" guess still
+            // resolves automatically.
+            var rest = Array(FleetPort.multiInstanceRange)
+            rest.removeAll { $0 == preferred }
+            candidatePorts = [preferred] + rest
+        } else {
+            candidatePorts = Array(FleetPort.multiInstanceRange)
+        }
+        listStatus = "Probing \(trimmedHost) on ports \(candidatePorts.map(String.init).joined(separator: ","))…"
+        let httpClient = self.httpClient
         Task { [weak self] in
-            do {
-                let response = try await client.workspaces(
-                    host: trimmedHost,
-                    port: portValue,
-                    timeout: 5
-                )
-                await MainActor.run {
-                    self?.availableWorkspaces = response.workspaces
-                    self?.listStatus = "Found \(response.workspaces.count) workspace(s)"
+            for portValue in candidatePorts {
+                // Hello first — confirms (a) something is listening,
+                // (b) tailnet auth passes, (c) it's a cmux fleet peer.
+                let hello: FleetHelloResponse?
+                do {
+                    hello = try await httpClient.hello(
+                        host: trimmedHost,
+                        port: portValue,
+                        timeout: 1.5
+                    )
+                } catch {
+                    hello = nil
                 }
-            } catch {
-                await MainActor.run {
-                    self?.availableWorkspaces = []
-                    self?.listStatus = "List failed: \(error)"
+                guard let hello else { continue }
+                do {
+                    let response = try await httpClient.workspaces(
+                        host: trimmedHost,
+                        port: portValue,
+                        timeout: 5
+                    )
+                    let summary =
+                        "Found \(response.workspaces.count) workspace(s) on " +
+                        "\(hello.displayName) @ :\(portValue)"
+                    await MainActor.run {
+                        guard let self = self else { return }
+                        self.port = String(portValue)
+                        self.availableWorkspaces = response.workspaces
+                        self.listStatus = summary
+                        self.persistDefaults()
+                    }
+                    return
+                } catch {
+                    await MainActor.run {
+                        self?.listStatus = "Workspaces fetch on :\(portValue) failed: \(error)"
+                    }
+                    return
                 }
+            }
+            await MainActor.run {
+                self?.availableWorkspaces = []
+                self?.listStatus = "No cmux fleet peer answered on \(trimmedHost)"
             }
         }
     }
