@@ -4391,8 +4391,9 @@ enum TerminalSurfaceFocusPlacement: Equatable {
 /// Unmanaged-retained `CmuxPTY` produced in `TerminalSurface.createSurface`;
 /// the retain is released in the matching teardown path.
 ///
-/// EAGAIN drops bytes for now — 5.5B is gated behind a debug toggle, and a
-/// proper SPSC ring + writability source is on the 5.5D burn-in list.
+/// `CmuxPTY.write` handles backpressure internally via an SPSC ring buffer
+/// drained by a DispatchSource.makeWriteSource — EAGAIN does not escape.
+/// Only unrecoverable errors (EIO, EBADF, etc.) reach this catch.
 private func cmuxManualIoWriteTrampoline(
     _ userdata: UnsafeMutableRawPointer?,
     _ ptr: UnsafePointer<CChar>?,

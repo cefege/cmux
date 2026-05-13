@@ -55,6 +55,32 @@ final class CmuxPTYIOTests: XCTestCase {
         XCTAssertEqual(status.reason, .exited(code: 7))
     }
 
+    func testWriteEAGAINDoesNotEscape() throws {
+        // Verifies the 5.5C/D ring-buffer change: even when the kernel master
+        // buffer is full, `write` enqueues the remainder instead of throwing
+        // EAGAIN at the caller. We force the kernel buffer to fill by spawning
+        // a shell that never reads stdin (`sleep 1` and exit). The slave-side
+        // kernel buffer is small (a few KiB on macOS); pushing 64 KiB at it
+        // is enough to hit at least one EAGAIN inside `write`.
+        let pty = try CmuxPTY.spawn(
+            CmuxPTYSpawn(
+                executablePath: "/bin/sh",
+                arguments: ["-c", "sleep 1"]
+            )
+        )
+        defer { reap(pty) }
+
+        // Drain echoed output so the master->slave write path isn't blocked
+        // by a full slave->master buffer.
+        pty.setOutputHandler { _ in }
+
+        let payload = Data(repeating: 0x41, count: 64 * 1024)
+        XCTAssertNoThrow(try payload.withUnsafeBytes { try pty.write($0) })
+        // The whole 64 KiB should fit in the 1 MiB ring (kernel buffer +
+        // ring combined). Nothing should be dropped.
+        XCTAssertEqual(pty.writeBufferDroppedBytes, 0)
+    }
+
     func testTerminateDeliversSIGHUP() throws {
         let pty = try CmuxPTY.spawn(
             CmuxPTYSpawn(

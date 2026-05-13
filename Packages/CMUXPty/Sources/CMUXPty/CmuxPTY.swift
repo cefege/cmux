@@ -20,6 +20,27 @@ public final class CmuxPTY: @unchecked Sendable {
     private var exitHandler: ExitHandler?
     private var isClosed = false
 
+    /// Write-side backpressure. The Ghostty IO thread calls `write` and must
+    /// never block: if the kernel buffer is full (EAGAIN) the remainder of
+    /// the write goes into `writeBuffer` and a DispatchSource.makeWriteSource
+    /// on the masterFD drains the queue when the kernel reports writability.
+    /// `writeBuffer` is bounded; overflow drops the newest bytes and bumps
+    /// `writeBufferDroppedBytes` so a caller can surface a regression in the
+    /// debug log without spinning on backpressure.
+    private let writeLock = NSLock()
+    private var writeBuffer = Data()
+    private var writeSource: DispatchSourceWrite?
+    private var writeSourceSuspended = true
+    private static let writeBufferLimit = 1 << 20  // 1 MiB
+    private var droppedWriteBytes: UInt64 = 0
+    /// Cumulative bytes dropped to backpressure overflow since spawn. Useful
+    /// for dogfood diagnostics; under normal terminal interaction this stays 0.
+    public var writeBufferDroppedBytes: UInt64 {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        return droppedWriteBytes
+    }
+
     private init(masterFD: Int32, childPID: pid_t, spawnedAt: Date) {
         self.masterFD = masterFD
         self.childPID = childPID
@@ -205,24 +226,89 @@ public final class CmuxPTY: @unchecked Sendable {
         }
     }
 
-    /// Synchronously write `bytes` to the master fd. The master is non-blocking;
-    /// EAGAIN is reported as `.writeFailed(errno: EAGAIN)` and the caller is
-    /// expected to retry. 5.5B layers a ring buffer + writability source so the
-    /// Ghostty IO thread never blocks on a full kernel buffer.
+    /// Write `bytes` to the master fd without blocking the caller. Tries an
+    /// inline non-blocking `write(2)` first; any remainder (EAGAIN, partial
+    /// completion) is enqueued into `writeBuffer` and drained by a
+    /// DispatchSource.makeWriteSource on subsequent writability events.
+    /// Returns immediately. Only throws for unrecoverable write errors
+    /// (EIO, EBADF, etc.) — EAGAIN never escapes.
     public func write(_ bytes: UnsafeRawBufferPointer) throws {
         guard let base = bytes.baseAddress, !bytes.isEmpty else { return }
-        var written = 0
-        while written < bytes.count {
-            let n = Darwin.write(masterFD, base.advanced(by: written), bytes.count - written)
+        writeLock.lock()
+        defer { writeLock.unlock() }
+
+        // Preserve byte order: if anything is already queued, the new bytes
+        // must wait their turn behind it.
+        if writeBuffer.isEmpty {
+            var written = 0
+            while written < bytes.count {
+                let n = Darwin.write(masterFD, base.advanced(by: written), bytes.count - written)
+                if n > 0 {
+                    written += n
+                    continue
+                }
+                if n == -1 {
+                    if errno == EINTR { continue }
+                    if errno == EAGAIN || errno == EWOULDBLOCK { break }
+                    throw CmuxPTYError.writeFailed(errno: errno)
+                }
+                break
+            }
+            if written < bytes.count {
+                let start = base.advanced(by: written)
+                let remaining = bytes.count - written
+                enqueueLocked(UnsafeRawBufferPointer(start: start, count: remaining))
+                ensureWriteSourceLocked()
+            }
+        } else {
+            enqueueLocked(bytes)
+            ensureWriteSourceLocked()
+        }
+    }
+
+    private func enqueueLocked(_ bytes: UnsafeRawBufferPointer) {
+        let available = Self.writeBufferLimit - writeBuffer.count
+        let toAccept = max(0, min(bytes.count, available))
+        if toAccept > 0, let base = bytes.baseAddress {
+            writeBuffer.append(base.assumingMemoryBound(to: UInt8.self), count: toAccept)
+        }
+        let dropped = bytes.count - toAccept
+        if dropped > 0 {
+            droppedWriteBytes &+= UInt64(dropped)
+        }
+    }
+
+    private func ensureWriteSourceLocked() {
+        if isClosed { return }
+        if writeSource == nil {
+            let src = DispatchSource.makeWriteSource(fileDescriptor: masterFD, queue: stateQueue)
+            src.setEventHandler { [weak self] in self?.drainWriteBuffer() }
+            writeSource = src
+        }
+        if writeSourceSuspended {
+            writeSourceSuspended = false
+            writeSource?.resume()
+        }
+    }
+
+    private func drainWriteBuffer() {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        while !writeBuffer.isEmpty {
+            let n = writeBuffer.withUnsafeBytes { buf -> ssize_t in
+                guard let base = buf.baseAddress else { return 0 }
+                return Darwin.write(masterFD, base, buf.count)
+            }
             if n > 0 {
-                written += n
+                writeBuffer.removeSubrange(0..<Int(n))
                 continue
             }
-            if n == -1 {
-                if errno == EINTR { continue }
-                throw CmuxPTYError.writeFailed(errno: errno)
-            }
+            if n == -1 && errno == EINTR { continue }
             break
+        }
+        if writeBuffer.isEmpty, let src = writeSource, !writeSourceSuspended {
+            writeSourceSuspended = true
+            src.suspend()
         }
     }
 
@@ -262,6 +348,21 @@ public final class CmuxPTY: @unchecked Sendable {
             self.exitSource = nil
             self.outputHandler = nil
             self.exitHandler = nil
+
+            // DispatchSourceWrite must be resumed before cancel; cancelling a
+            // suspended source leaks (per Apple docs). Take the writeLock so
+            // we don't race with an in-flight enqueue / drain.
+            self.writeLock.lock()
+            if let src = self.writeSource {
+                if self.writeSourceSuspended {
+                    self.writeSourceSuspended = false
+                    src.resume()
+                }
+                src.cancel()
+                self.writeSource = nil
+            }
+            self.writeBuffer.removeAll(keepingCapacity: false)
+            self.writeLock.unlock()
         }
         _ = group.wait(timeout: .now() + 1.0)
         _ = Darwin.close(masterFD)
