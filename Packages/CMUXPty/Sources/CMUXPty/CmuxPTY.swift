@@ -41,6 +41,83 @@ public final class CmuxPTY: @unchecked Sendable {
         return droppedWriteBytes
     }
 
+    // MARK: - Write stats aggregator (5.5D burn-in)
+
+    /// Single-write timing samples roll up here. The trampoline reports each
+    /// call's duration and byte count; every `writeStatsFlushInterval` writes
+    /// the trampoline pulls `flushWriteStats()` to emit an aggregate
+    /// `fleet.manualPty.write_stats` log record. The aggregator is kept
+    /// in-process to avoid logging on every write — for typical typing
+    /// (hundreds of writes/sec during a paste) per-write logs are noise.
+    public struct WriteStats: Sendable {
+        public var sampleCount: UInt64 = 0
+        public var totalBytes: UInt64 = 0
+        public var maxDurationUs: UInt64 = 0
+        public var droppedBytes: UInt64 = 0
+        /// Counts in buckets aligned with `bucketUpperBoundsUs`. The last
+        /// bucket captures everything above the final threshold.
+        public var bucketCounts: [UInt64] = Array(repeating: 0, count: bucketUpperBoundsUs.count + 1)
+        public static let bucketUpperBoundsUs: [UInt64] = [100, 500, 1_000, 5_000, 10_000]
+
+        /// Estimate the duration at percentile `p` (0…1) by scanning the
+        /// bucket histogram. The returned value is the upper bound of the
+        /// bucket containing the requested rank; coarse, but enough to
+        /// answer "is p99 over a frame?" without storing per-sample data.
+        public func percentileUs(_ p: Double) -> UInt64 {
+            guard sampleCount > 0 else { return 0 }
+            let target = UInt64((Double(sampleCount) * p).rounded(.up))
+            var running: UInt64 = 0
+            for (idx, count) in bucketCounts.enumerated() {
+                running &+= count
+                if running >= target {
+                    if idx < Self.bucketUpperBoundsUs.count {
+                        return Self.bucketUpperBoundsUs[idx]
+                    }
+                    return maxDurationUs
+                }
+            }
+            return maxDurationUs
+        }
+    }
+
+    private var writeStats = WriteStats()
+    public var writeStatsFlushInterval: UInt64 = 1_000
+
+    /// Append a timing sample. Called by the trampoline after every
+    /// `write` invocation. Cheap: hashmap-free, lock taken briefly.
+    public func recordWriteSample(durationUs: UInt64, bytes: Int) {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        writeStats.sampleCount &+= 1
+        writeStats.totalBytes &+= UInt64(max(0, bytes))
+        if durationUs > writeStats.maxDurationUs {
+            writeStats.maxDurationUs = durationUs
+        }
+        var placed = false
+        for (idx, threshold) in WriteStats.bucketUpperBoundsUs.enumerated() where !placed {
+            if durationUs <= threshold {
+                writeStats.bucketCounts[idx] &+= 1
+                placed = true
+            }
+        }
+        if !placed {
+            writeStats.bucketCounts[WriteStats.bucketUpperBoundsUs.count] &+= 1
+        }
+    }
+
+    /// True when the trampoline should pull a rollup after the latest
+    /// sample. Returns the snapshot atomically with the reset so two
+    /// rollups can't double-count or drop a sample.
+    public func consumeWriteStatsIfReady() -> WriteStats? {
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        guard writeStats.sampleCount >= writeStatsFlushInterval else { return nil }
+        var snapshot = writeStats
+        snapshot.droppedBytes = droppedWriteBytes
+        writeStats = WriteStats()
+        return snapshot
+    }
+
     private init(masterFD: Int32, childPID: pid_t, spawnedAt: Date) {
         self.masterFD = masterFD
         self.childPID = childPID

@@ -4428,6 +4428,27 @@ private func cmuxManualIoWriteTrampoline(
             "dropped_total=\(pty.writeBufferDroppedBytes)"
         )
     }
+    pty.recordWriteSample(durationUs: durationUs, bytes: Int(len))
+    if let stats = pty.consumeWriteStatsIfReady() {
+        let buckets = stats.bucketCounts
+            .enumerated()
+            .map { idx, count -> String in
+                let label: String
+                if idx < CmuxPTY.WriteStats.bucketUpperBoundsUs.count {
+                    label = "le\(CmuxPTY.WriteStats.bucketUpperBoundsUs[idx])"
+                } else {
+                    label = "gt\(CmuxPTY.WriteStats.bucketUpperBoundsUs.last ?? 0)"
+                }
+                return "\(label)=\(count)"
+            }
+            .joined(separator: ",")
+        cmuxDebugLog(
+            "fleet.manualPty.write_stats writes=\(stats.sampleCount) bytes=\(stats.totalBytes) " +
+            "max_us=\(stats.maxDurationUs) p50_us=\(stats.percentileUs(0.50)) " +
+            "p99_us=\(stats.percentileUs(0.99)) dropped=\(stats.droppedBytes) " +
+            "[\(buckets)]"
+        )
+    }
 #endif
 }
 
