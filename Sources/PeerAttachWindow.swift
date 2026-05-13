@@ -15,20 +15,38 @@ import SwiftUI
 /// TerminalSurface integration lands.
 @MainActor
 final class PeerAttachViewModel: ObservableObject {
-    @Published var host: String = ""
-    @Published var port: String = "14242"
-    @Published var workspaceId: String = ""
+    @Published var host: String
+    @Published var port: String
+    @Published var workspaceId: String
     @Published var transcript: String = ""
     @Published var status: String = "Disconnected"
     @Published var isConnected: Bool = false
     @Published var pendingInput: String = ""
+    @Published var availableWorkspaces: [RemoteWorkspace] = []
+    @Published var listStatus: String = ""
 
     private var session: FleetAttachSession?
     private var consumer: Task<Void, Never>?
-    private let client: FleetAttachClient = URLSessionFleetAttachClient(
+    private let attachClient: FleetAttachClient = URLSessionFleetAttachClient(
+        session: URLSession(configuration: .ephemeral)
+    )
+    private let httpClient: FleetClient = URLSessionFleetClient(
         session: URLSession(configuration: .ephemeral)
     )
     private static let maxTranscriptChars = 256 * 1024
+
+    private enum DefaultsKey {
+        static let host = "fleet.peerAttachDebug.host"
+        static let port = "fleet.peerAttachDebug.port"
+        static let workspaceId = "fleet.peerAttachDebug.workspaceId"
+    }
+
+    init() {
+        let defaults = UserDefaults.standard
+        self.host = defaults.string(forKey: DefaultsKey.host) ?? ""
+        self.port = defaults.string(forKey: DefaultsKey.port) ?? "14242"
+        self.workspaceId = defaults.string(forKey: DefaultsKey.workspaceId) ?? ""
+    }
 
     func connect() {
         disconnect()
@@ -44,8 +62,9 @@ final class PeerAttachViewModel: ObservableObject {
             status = "Invalid port"
             return
         }
+        persistDefaults()
         do {
-            let newSession = try client.attach(
+            let newSession = try attachClient.attach(
                 host: trimmedHost,
                 port: portValue,
                 workspaceId: trimmedWorkspace
@@ -71,6 +90,45 @@ final class PeerAttachViewModel: ObservableObject {
             status = "Disconnected"
             appendTranscript("[disconnected]\n")
         }
+    }
+
+    /// Hit `/v1/workspaces` on the peer and populate `availableWorkspaces`
+    /// so the user can pick instead of typing a UUID. Tailnet auth still
+    /// applies — the host will return 403 if Tailscale isn't aligned.
+    func listWorkspaces() {
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedHost.isEmpty,
+              let portValue = UInt16(port.trimmingCharacters(in: .whitespacesAndNewlines)),
+              portValue > 0
+        else {
+            listStatus = "Need host + port"
+            return
+        }
+        listStatus = "Listing…"
+        let client = httpClient
+        Task { [weak self] in
+            do {
+                let response = try await client.workspaces(
+                    host: trimmedHost,
+                    port: portValue,
+                    timeout: 5
+                )
+                await MainActor.run {
+                    self?.availableWorkspaces = response.workspaces
+                    self?.listStatus = "Found \(response.workspaces.count) workspace(s)"
+                }
+            } catch {
+                await MainActor.run {
+                    self?.availableWorkspaces = []
+                    self?.listStatus = "List failed: \(error)"
+                }
+            }
+        }
+    }
+
+    func selectWorkspace(_ workspace: RemoteWorkspace) {
+        workspaceId = workspace.id
+        persistDefaults()
     }
 
     func sendPendingInput() {
@@ -158,6 +216,13 @@ final class PeerAttachViewModel: ObservableObject {
             transcript.removeFirst(overflow)
         }
     }
+
+    private func persistDefaults() {
+        let defaults = UserDefaults.standard
+        defaults.set(host, forKey: DefaultsKey.host)
+        defaults.set(port, forKey: DefaultsKey.port)
+        defaults.set(workspaceId, forKey: DefaultsKey.workspaceId)
+    }
 }
 
 private struct PeerAttachDebugView: View {
@@ -166,12 +231,13 @@ private struct PeerAttachDebugView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             connectionForm
+            workspacePicker
             statusLine
             transcript
             inputRow
         }
         .padding(16)
-        .frame(minWidth: 520, minHeight: 480)
+        .frame(minWidth: 560, minHeight: 540)
     }
 
     private var connectionForm: some View {
@@ -196,6 +262,29 @@ private struct PeerAttachDebugView: View {
         }
     }
 
+    private var workspacePicker: some View {
+        HStack(spacing: 8) {
+            Button("List Workspaces") { model.listWorkspaces() }
+                .disabled(model.isConnected)
+            if !model.availableWorkspaces.isEmpty {
+                Menu("Pick…") {
+                    ForEach(model.availableWorkspaces, id: \.id) { workspace in
+                        Button(action: { model.selectWorkspace(workspace) }) {
+                            Text("\(workspace.name) — \(workspace.id.prefix(8))")
+                        }
+                    }
+                }
+                .disabled(model.isConnected)
+            }
+            Text(model.listStatus)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer()
+        }
+    }
+
     private var statusLine: some View {
         HStack(spacing: 8) {
             Circle()
@@ -204,6 +293,8 @@ private struct PeerAttachDebugView: View {
             Text(model.status)
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
             Spacer()
             Button("Send 80x24 resize") {
                 model.sendResize(cols: 80, rows: 24)
@@ -253,7 +344,7 @@ final class PeerAttachWindowController: NSWindowController, NSWindowDelegate {
 
     private init() {
         let window = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 540),
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 580),
             styleMask: [.titled, .closable, .resizable, .utilityWindow],
             backing: .buffered,
             defer: false
@@ -264,7 +355,7 @@ final class PeerAttachWindowController: NSWindowController, NSWindowDelegate {
         window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
         window.identifier = NSUserInterfaceItemIdentifier("cmux.peerAttachDebug")
-        window.minSize = NSSize(width: 520, height: 420)
+        window.minSize = NSSize(width: 560, height: 460)
         window.center()
         let rootView = PeerAttachDebugView(model: model)
         window.contentView = NSHostingView(rootView: rootView)
