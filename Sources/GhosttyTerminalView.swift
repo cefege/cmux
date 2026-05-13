@@ -5671,6 +5671,39 @@ final class TerminalSurface: Identifiable, ObservableObject {
                       !chunk.isEmpty else { return }
                 ghostty_surface_process_output(surfaceForCallback, base, UInt(chunk.count))
             }
+            // Peer input/resize sinks: typed bytes get written to the
+            // master fd through the ring-buffered CmuxPTY.write path
+            // (same EAGAIN-safe queue the renderer uses), and resize
+            // events fan through CmuxPTY.resize which issues TIOCSWINSZ
+            // on the slave so the child shell sees the new grid.
+            broadcast.setInputSink { [weak pty] data in
+                guard let pty = pty, !data.isEmpty else { return }
+                data.withUnsafeBytes { raw in
+                    do {
+                        try pty.write(raw)
+                    } catch {
+#if DEBUG
+                        cmuxDebugLog(
+                            "fleet.manualPty.attach.input.error bytes=\(data.count) " +
+                            "err=\(String(describing: error))"
+                        )
+#endif
+                    }
+                }
+            }
+            broadcast.setResizeSink { [weak pty] cols, rows in
+                guard let pty = pty, cols > 0, rows > 0 else { return }
+                do {
+                    try pty.resize(Winsize(columns: cols, rows: rows))
+                } catch {
+#if DEBUG
+                    cmuxDebugLog(
+                        "fleet.manualPty.attach.resize.error cols=\(cols) rows=\(rows) " +
+                        "err=\(String(describing: error))"
+                    )
+#endif
+                }
+            }
             manualPtyBroadcast = broadcast
             let workspaceId = tabId
             Task.detached {

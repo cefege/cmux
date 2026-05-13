@@ -251,15 +251,17 @@ public actor FleetCoordinator {
                 channel.sendText(text)
             }
 
-            // Keep the channel open until the peer disconnects. The receive
-            // loop just drains frames (input handling is a later slice);
-            // when it ends we tear down the subscription so the host stops
-            // forwarding bytes.
+            // Keep the channel open until the peer disconnects. Frames the
+            // peer sends are JSON envelopes — `{"type":"in","data":<b64>}`
+            // forwards typing into the host's PTY via subscription.sendInput,
+            // and `{"type":"resize","cols":N,"rows":M}` forwards grid
+            // resizes via subscription.sendResize. Unknown frames are
+            // ignored so the protocol can grow without breaking peers.
             let receiveStream = channel.start()
             do {
-                for try await _ in receiveStream {
-                    // Input frames are ignored until bidirectional support
-                    // lands; the iteration still keeps the connection alive.
+                for try await frame in receiveStream {
+                    guard frame.opcode == .text else { continue }
+                    Self.dispatchAttachClientFrame(frame.payload, subscription: subscription)
                 }
             } catch {
                 // Receive errored — peer dropped or framing broke. Fall
@@ -268,6 +270,56 @@ public actor FleetCoordinator {
             subscription.close()
             channel.close(code: 1000, reason: "attach complete")
         }
+    }
+
+    /// Parse a single client→host attach frame (JSON text) and dispatch it
+    /// to the subscription's input or resize sink. Robust against malformed
+    /// payloads — anything we can't decode is just dropped.
+    private static func dispatchAttachClientFrame(
+        _ payload: Data,
+        subscription: AttachSubscription
+    ) {
+        guard
+            let object = try? JSONSerialization.jsonObject(with: payload),
+            let dict = object as? [String: Any],
+            let type = dict["type"] as? String
+        else { return }
+        switch type {
+        case "in":
+            guard let b64 = dict["data"] as? String,
+                  let bytes = Data(base64Encoded: b64),
+                  !bytes.isEmpty
+            else { return }
+            subscription.sendInput(bytes)
+        case "resize":
+            // Accept both integer literals and stringified numbers — JS
+            // clients often coerce window dims into strings on the wire.
+            let cols = uintFromAny(dict["cols"])
+            let rows = uintFromAny(dict["rows"])
+            guard let cols, let rows, cols > 0, rows > 0 else { return }
+            subscription.sendResize(cols: cols, rows: rows)
+        default:
+            break
+        }
+    }
+
+    private static func uintFromAny(_ raw: Any?) -> UInt16? {
+        if let n = raw as? Int, n > 0, n <= Int(UInt16.max) {
+            return UInt16(n)
+        }
+        if let n = raw as? Int32, n > 0, n <= Int32(UInt16.max) {
+            return UInt16(n)
+        }
+        if let n = raw as? UInt, n > 0, n <= UInt(UInt16.max) {
+            return UInt16(n)
+        }
+        if let n = raw as? Double, n > 0, n <= Double(UInt16.max) {
+            return UInt16(n)
+        }
+        if let s = raw as? String, let n = UInt16(s), n > 0 {
+            return n
+        }
+        return nil
     }
 
     /// Falls back to ephemeral (port 0) only if every preferred port is in

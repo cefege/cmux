@@ -17,15 +17,47 @@ import Foundation
 final class ManualPtyOutputBroadcast: @unchecked Sendable {
     typealias PrimaryHandler = @Sendable (UnsafeRawBufferPointer) -> Void
     typealias Subscriber = @Sendable (Data) -> Void
+    typealias InputSink = @Sendable (Data) -> Void
+    typealias ResizeSink = @Sendable (UInt16, UInt16) -> Void
 
+    /// Sinks the attach provider can forward peer-driven input and
+    /// resize events through. Set by `TerminalSurface.createSurface`
+    /// when wiring the broadcast to the live CmuxPTY; the broadcast
+    /// itself doesn't know about CmuxPTY (avoids the cross-package
+    /// import). Either or both can be nil for surfaces that don't yet
+    /// support peer input.
     private let lock = NSLock()
     private var primary: PrimaryHandler?
     private var subscribers: [UUID: Subscriber] = [:]
+    private var inputSink: InputSink?
+    private var resizeSink: ResizeSink?
 
     func setPrimary(_ handler: @escaping PrimaryHandler) {
         lock.lock()
         primary = handler
         lock.unlock()
+    }
+
+    func setInputSink(_ handler: @escaping InputSink) {
+        lock.lock()
+        inputSink = handler
+        lock.unlock()
+    }
+
+    func setResizeSink(_ handler: @escaping ResizeSink) {
+        lock.lock()
+        resizeSink = handler
+        lock.unlock()
+    }
+
+    func currentInputSink() -> InputSink? {
+        lock.lock(); defer { lock.unlock() }
+        return inputSink
+    }
+
+    func currentResizeSink() -> ResizeSink? {
+        lock.lock(); defer { lock.unlock() }
+        return resizeSink
     }
 
     @discardableResult
@@ -109,8 +141,14 @@ struct LocalManualPtyAttachProvider: WorkspaceAttachProvider {
             return nil
         }
         let id = broadcast.addSubscriber(onOutput)
-        return AttachSubscription { [weak broadcast] in
-            broadcast?.removeSubscriber(id)
-        }
+        let inputSink = broadcast.currentInputSink()
+        let resizeSink = broadcast.currentResizeSink()
+        return AttachSubscription(
+            unsubscribe: { [weak broadcast] in
+                broadcast?.removeSubscriber(id)
+            },
+            inputSink: inputSink,
+            resizeSink: resizeSink
+        )
     }
 }

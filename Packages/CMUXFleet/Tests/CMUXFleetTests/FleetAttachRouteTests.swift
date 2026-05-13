@@ -117,6 +117,99 @@ final class FleetAttachRouteTests: XCTestCase {
         try await provider.waitForSubscriptionCleared(timeoutSeconds: 2)
     }
 
+    func testAttachClientInputAndResizeForwardedToHost() async throws {
+        let hostUuid = UUID(uuidString: "CCCCCCCC-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!
+        let (storage, tempDir) = try makeStorage()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        try storage.save(FleetIdentity(hostId: hostUuid, displayName: "host", createdAtUnix: 0))
+
+        let provider = StubWorkspaceAttachProvider(knownWorkspaceId: "ws_bidi")
+        let coordinator = makeCoordinator(storage: storage, attachProvider: provider)
+        let binding = try await coordinator.start()
+        defer { Task { await coordinator.stop() } }
+
+        let url = URL(string: "ws://\(binding.ip):\(binding.port)/v1/workspaces/ws_bidi/attach")!
+        let session = URLSession(configuration: .ephemeral)
+        let task = session.webSocketTask(with: url)
+        task.resume()
+
+        _ = try await receiveJSONFrame(task: task)  // attach_hello
+        try await provider.waitForActiveSubscription(timeoutSeconds: 2)
+
+        let inputBytes = Data("hello-from-peer".utf8)
+        let inputFrame: [String: Any] = [
+            "type": "in",
+            "data": inputBytes.base64EncodedString(),
+        ]
+        try await sendJSONFrame(task: task, payload: inputFrame)
+
+        let resizeFrame: [String: Any] = [
+            "type": "resize",
+            "cols": 132,
+            "rows": 48,
+        ]
+        try await sendJSONFrame(task: task, payload: resizeFrame)
+
+        // Frame dispatch happens off-handler; poll briefly for them to land.
+        try await waitForCondition(timeoutSeconds: 2) {
+            !provider.capturedInputs.isEmpty && !provider.capturedResizes.isEmpty
+        }
+
+        XCTAssertEqual(provider.capturedInputs, [inputBytes])
+        XCTAssertEqual(provider.capturedResizes.count, 1)
+        XCTAssertEqual(provider.capturedResizes.first?.0, 132)
+        XCTAssertEqual(provider.capturedResizes.first?.1, 48)
+
+        task.cancel(with: .normalClosure, reason: nil)
+        try await provider.waitForSubscriptionCleared(timeoutSeconds: 2)
+    }
+
+    func testAttachIgnoresMalformedClientFrames() async throws {
+        let hostUuid = UUID(uuidString: "DDDDDDDD-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!
+        let (storage, tempDir) = try makeStorage()
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        try storage.save(FleetIdentity(hostId: hostUuid, displayName: "host", createdAtUnix: 0))
+
+        let provider = StubWorkspaceAttachProvider(knownWorkspaceId: "ws_malformed")
+        let coordinator = makeCoordinator(storage: storage, attachProvider: provider)
+        let binding = try await coordinator.start()
+        defer { Task { await coordinator.stop() } }
+
+        let url = URL(string: "ws://\(binding.ip):\(binding.port)/v1/workspaces/ws_malformed/attach")!
+        let session = URLSession(configuration: .ephemeral)
+        let task = session.webSocketTask(with: url)
+        task.resume()
+
+        _ = try await receiveJSONFrame(task: task)
+        try await provider.waitForActiveSubscription(timeoutSeconds: 2)
+
+        // Empty payload, junk text, unknown type, missing fields, bogus
+        // base64, zero-dimension resize — all should be silently ignored.
+        try await task.send(.string(""))
+        try await task.send(.string("not-json"))
+        try await sendJSONFrame(task: task, payload: ["type": "ping"])
+        try await sendJSONFrame(task: task, payload: ["type": "in"])
+        try await sendJSONFrame(task: task, payload: ["type": "in", "data": "!!!not-base64!!!"])
+        try await sendJSONFrame(task: task, payload: ["type": "resize", "cols": 0, "rows": 24])
+
+        // Then a real frame to prove the channel is still healthy.
+        try await sendJSONFrame(task: task, payload: [
+            "type": "resize",
+            "cols": 100,
+            "rows": 32,
+        ])
+
+        try await waitForCondition(timeoutSeconds: 2) {
+            !provider.capturedResizes.isEmpty
+        }
+        XCTAssertEqual(provider.capturedInputs, [])
+        XCTAssertEqual(provider.capturedResizes.count, 1)
+        XCTAssertEqual(provider.capturedResizes.first?.0, 100)
+        XCTAssertEqual(provider.capturedResizes.first?.1, 32)
+
+        task.cancel(with: .normalClosure, reason: nil)
+    }
+
     func testAttachRejectsForeignTailnet() async throws {
         let foreignUserId: Int64 = 99999
         let selfNode = TailscaleNode(
@@ -178,15 +271,43 @@ final class FleetAttachRouteTests: XCTestCase {
             try JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any]
         )
     }
+
+    private func sendJSONFrame(
+        task: URLSessionWebSocketTask,
+        payload: [String: Any]
+    ) async throws {
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        let text = try XCTUnwrap(String(data: data, encoding: .utf8))
+        try await task.send(.string(text))
+    }
+
+    private func waitForCondition(
+        timeoutSeconds: Double,
+        condition: @Sendable () -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while !condition() {
+            if Date() >= deadline {
+                throw NSError(domain: "FleetAttachRouteTests", code: 3, userInfo: [
+                    NSLocalizedDescriptionKey: "condition not met within \(timeoutSeconds)s"
+                ])
+            }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+    }
 }
 
 /// In-test WorkspaceAttachProvider that pretends to host one specific
 /// workspace id. Captures the active output handler so tests can drive
-/// bytes through and inspect tear-down.
+/// bytes through and inspect tear-down. Also captures any input/resize
+/// frames the attach handler forwards back so bidirectional flow can be
+/// asserted.
 private final class StubWorkspaceAttachProvider: WorkspaceAttachProvider, @unchecked Sendable {
     private let knownWorkspaceId: String
     private let lock = NSLock()
     private var activeHandler: (@Sendable (Data) -> Void)?
+    private var inputs: [Data] = []
+    private var resizes: [(UInt16, UInt16)] = []
 
     init(knownWorkspaceId: String) {
         self.knownWorkspaceId = knownWorkspaceId
@@ -198,9 +319,11 @@ private final class StubWorkspaceAttachProvider: WorkspaceAttachProvider, @unche
     ) async -> AttachSubscription? {
         guard workspaceId == knownWorkspaceId else { return nil }
         setHandler(onOutput)
-        return AttachSubscription { [weak self] in
-            self?.setHandler(nil)
-        }
+        return AttachSubscription(
+            unsubscribe: { [weak self] in self?.setHandler(nil) },
+            inputSink: { [weak self] data in self?.recordInput(data) },
+            resizeSink: { [weak self] cols, rows in self?.recordResize(cols: cols, rows: rows) }
+        )
     }
 
     func publish(_ bytes: Data) {
@@ -210,6 +333,16 @@ private final class StubWorkspaceAttachProvider: WorkspaceAttachProvider, @unche
 
     var hasActiveSubscription: Bool {
         currentHandler() != nil
+    }
+
+    var capturedInputs: [Data] {
+        lock.lock(); defer { lock.unlock() }
+        return inputs
+    }
+
+    var capturedResizes: [(UInt16, UInt16)] {
+        lock.lock(); defer { lock.unlock() }
+        return resizes
     }
 
     private func setHandler(_ handler: (@Sendable (Data) -> Void)?) {
@@ -222,6 +355,18 @@ private final class StubWorkspaceAttachProvider: WorkspaceAttachProvider, @unche
         lock.lock()
         defer { lock.unlock() }
         return activeHandler
+    }
+
+    private func recordInput(_ data: Data) {
+        lock.lock()
+        inputs.append(data)
+        lock.unlock()
+    }
+
+    private func recordResize(cols: UInt16, rows: UInt16) {
+        lock.lock()
+        resizes.append((cols, rows))
+        lock.unlock()
     }
 
     func waitForActiveSubscription(timeoutSeconds: Double) async throws {
