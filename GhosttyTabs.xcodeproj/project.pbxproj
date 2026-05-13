@@ -50,6 +50,7 @@
 		AA11BB22CC33DD44EE99F101 /* AppDelegate+Fleet.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA11BB22CC33DD44EE99F102 /* AppDelegate+Fleet.swift */; };
 		AA11BB22CC33DD44EE99F201 /* CmuxFleetWorkspaceProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA11BB22CC33DD44EE99F202 /* CmuxFleetWorkspaceProvider.swift */; };
 		AA11BB22CC33DD44EE99F203 /* FleetWorkspaceEventBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA11BB22CC33DD44EE99F204 /* FleetWorkspaceEventBridge.swift */; };
+		CCFE0000000000000000FT01 /* FleetManualPtySettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = CCFE0000000000000000FT02 /* FleetManualPtySettings.swift */; };
 		E3309A01 /* AppDelegate+EqualizeSplitsShortcut.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3309A02 /* AppDelegate+EqualizeSplitsShortcut.swift */; };
 		E3309A03 /* TabManager+EqualizeSplits.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3309A04 /* TabManager+EqualizeSplits.swift */; };
 		E3309A05 /* Workspace+EqualizeSplitsSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3309A06 /* Workspace+EqualizeSplitsSupport.swift */; };
@@ -88,6 +89,7 @@
 		5EDB6027B346C46521A93C74 /* CMUXAuthCore in Frameworks */ = {isa = PBXBuildFile; productRef = 29813FE5A6CBC1019289A251 /* CMUXAuthCore */; };
 		AA11BB22CC33DD44EE550001 /* CMUXWorkstream in Frameworks */ = {isa = PBXBuildFile; productRef = AA11BB22CC33DD44EE550002 /* CMUXWorkstream */; };
 		AA11BB22CC33DD44EE551001 /* CMUXFleet in Frameworks */ = {isa = PBXBuildFile; productRef = AA11BB22CC33DD44EE551002 /* CMUXFleet */; };
+		CCFE0000000000000000PT01 /* CMUXPty in Frameworks */ = {isa = PBXBuildFile; productRef = CCFE0000000000000000PT02 /* CMUXPty */; };
 		3069F1D10000000000000005 /* CMUXPasteboardFidelity in Frameworks */ = {isa = PBXBuildFile; productRef = 3069F1D10000000000000006 /* CMUXPasteboardFidelity */; };
 		F53000A0A1B2C3D4E5F60718 /* CMUXAgentVault in Frameworks */ = {isa = PBXBuildFile; productRef = F53000A2A1B2C3D4E5F60718 /* CMUXAgentVault */; };
 		A5B00003A1B2C3D4E5F60718 /* CMUXAgentLaunch in Frameworks */ = {isa = PBXBuildFile; productRef = A5B00002A1B2C3D4E5F60718 /* CMUXAgentLaunch */; };
@@ -697,6 +699,7 @@
 		AA11BB22CC33DD44EE99F102 /* AppDelegate+Fleet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppDelegate+Fleet.swift"; sourceTree = "<group>"; };
 		AA11BB22CC33DD44EE99F202 /* CmuxFleetWorkspaceProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CmuxFleetWorkspaceProvider.swift; sourceTree = "<group>"; };
 		AA11BB22CC33DD44EE99F204 /* FleetWorkspaceEventBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FleetWorkspaceEventBridge.swift; sourceTree = "<group>"; };
+		CCFE0000000000000000FT02 /* FleetManualPtySettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FleetManualPtySettings.swift; sourceTree = "<group>"; };
 		E3309A02 /* AppDelegate+EqualizeSplitsShortcut.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppDelegate+EqualizeSplitsShortcut.swift"; sourceTree = "<group>"; };
 		C10D00020000000000000002 /* CloudVMActionLauncher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudVMActionLauncher.swift; sourceTree = "<group>"; };
 		D7AB00000000000000000002 /* AppDelegate+MoveTabToNewWorkspace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppDelegate+MoveTabToNewWorkspace.swift"; sourceTree = "<group>"; };
@@ -955,6 +958,7 @@
 				5EDB6027B346C46521A93C74 /* CMUXAuthCore in Frameworks */,
 				AA11BB22CC33DD44EE550001 /* CMUXWorkstream in Frameworks */,
 				AA11BB22CC33DD44EE551001 /* CMUXFleet in Frameworks */,
+				CCFE0000000000000000PT01 /* CMUXPty in Frameworks */,
 				3069F1D10000000000000005 /* CMUXPasteboardFidelity in Frameworks */,
 				F53000A0A1B2C3D4E5F60718 /* CMUXAgentVault in Frameworks */,
 				A5B00003A1B2C3D4E5F60718 /* CMUXAgentLaunch in Frameworks */,
@@ -1245,6 +1249,7 @@
 				AA11BB22CC33DD44EE99F102 /* AppDelegate+Fleet.swift */,
 				AA11BB22CC33DD44EE99F202 /* CmuxFleetWorkspaceProvider.swift */,
 				AA11BB22CC33DD44EE99F204 /* FleetWorkspaceEventBridge.swift */,
+				CCFE0000000000000000FT02 /* FleetManualPtySettings.swift */,
 				E3309A02 /* AppDelegate+EqualizeSplitsShortcut.swift */,
 				D7AB00000000000000000002 /* AppDelegate+MoveTabToNewWorkspace.swift */,
 				2907A0022907A0022907A002 /* AppDelegate+RecoverableMainWindowRoutes.swift */,
@@ -1533,6 +1538,7 @@
 				29813FE5A6CBC1019289A251 /* CMUXAuthCore */,
 				AA11BB22CC33DD44EE550002 /* CMUXWorkstream */,
 				AA11BB22CC33DD44EE551002 /* CMUXFleet */,
+				CCFE0000000000000000PT02 /* CMUXPty */,
 				3069F1D10000000000000006 /* CMUXPasteboardFidelity */,
 				F53000A2A1B2C3D4E5F60718 /* CMUXAgentVault */,
 				A5B00002A1B2C3D4E5F60718 /* CMUXAgentLaunch */,
@@ -1664,6 +1670,7 @@
 				40B63BB4A170F0BD2D1DEFD1 /* XCLocalSwiftPackageReference "CMUXAuthCore" */,
 				AA11BB22CC33DD44EE550003 /* XCLocalSwiftPackageReference "CMUXWorkstream" */,
 				AA11BB22CC33DD44EE551003 /* XCLocalSwiftPackageReference "CMUXFleet" */,
+				CCFE0000000000000000PT03 /* XCLocalSwiftPackageReference "CMUXPty" */,
 				3069F1D10000000000000007 /* XCLocalSwiftPackageReference "CMUXPasteboardFidelity" */,
 				F53000A1A1B2C3D4E5F60718 /* XCLocalSwiftPackageReference "CMUXAgentVault" */,
 				A5B00001A1B2C3D4E5F60718 /* XCLocalSwiftPackageReference "CMUXAgentLaunch" */,
@@ -1890,6 +1897,7 @@
 				AA11BB22CC33DD44EE99F101 /* AppDelegate+Fleet.swift in Sources */,
 				AA11BB22CC33DD44EE99F201 /* CmuxFleetWorkspaceProvider.swift in Sources */,
 				AA11BB22CC33DD44EE99F203 /* FleetWorkspaceEventBridge.swift in Sources */,
+				CCFE0000000000000000FT01 /* FleetManualPtySettings.swift in Sources */,
 				A50016B1A1B2C3D4E5F60718 /* SessionSnapshotDebugBenchmark.swift in Sources */,
 				E3309A01 /* AppDelegate+EqualizeSplitsShortcut.swift in Sources */,
 				D7AB00000000000000000001 /* AppDelegate+MoveTabToNewWorkspace.swift in Sources */,
@@ -2590,6 +2598,10 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = Packages/CMUXFleet;
 		};
+		CCFE0000000000000000PT03 /* XCLocalSwiftPackageReference "CMUXPty" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/CMUXPty;
+		};
 		3069F1D10000000000000007 /* XCLocalSwiftPackageReference "CMUXPasteboardFidelity" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = Packages/CMUXPasteboardFidelity;
@@ -2662,6 +2674,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = AA11BB22CC33DD44EE551003 /* XCLocalSwiftPackageReference "CMUXFleet" */;
 			productName = CMUXFleet;
+		};
+		CCFE0000000000000000PT02 /* CMUXPty */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = CCFE0000000000000000PT03 /* XCLocalSwiftPackageReference "CMUXPty" */;
+			productName = CMUXPty;
 		};
 		3069F1D10000000000000006 /* CMUXPasteboardFidelity */ = {
 			isa = XCSwiftPackageProductDependency;

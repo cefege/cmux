@@ -11,6 +11,7 @@ import Sentry
 import Bonsplit
 import CMUXAgentLaunch
 import CMUXPasteboardFidelity
+import CMUXPty
 import IOSurface
 import UniformTypeIdentifiers
 
@@ -4385,6 +4386,108 @@ enum TerminalSurfaceFocusPlacement: Equatable {
     case rightSidebarDock
 }
 
+/// C trampoline invoked by Ghostty's IO thread when `io_mode = MANUAL` and the
+/// terminal wants to write bytes to the child process. `userdata` is an
+/// Unmanaged-retained `CmuxPTY` produced in `TerminalSurface.createSurface`;
+/// the retain is released in the matching teardown path.
+///
+/// EAGAIN drops bytes for now — 5.5B is gated behind a debug toggle, and a
+/// proper SPSC ring + writability source is on the 5.5D burn-in list.
+private func cmuxManualIoWriteTrampoline(
+    _ userdata: UnsafeMutableRawPointer?,
+    _ ptr: UnsafePointer<CChar>?,
+    _ len: UInt
+) {
+    guard let userdata, let ptr, len > 0 else { return }
+    let pty = Unmanaged<CmuxPTY>.fromOpaque(userdata).takeUnretainedValue()
+    let buffer = UnsafeRawBufferPointer(start: ptr, count: Int(len))
+    do {
+        try pty.write(buffer)
+    } catch {
+#if DEBUG
+        cmuxDebugLog("fleet.manualPty.write.error bytes=\(len) err=\(String(describing: error))")
+#endif
+    }
+}
+
+private enum FleetManualPtyLaunch {
+    static let manualTerm = "xterm-ghostty"
+
+    /// Mirror Ghostty Exec.zig's parity wiring: derive TERMINFO,
+    /// XDG_DATA_DIRS, and MANPATH from `GHOSTTY_RESOURCES_DIR`. Without
+    /// TERMINFO the bundled `terminfo` db is invisible to ncurses and the
+    /// cmux shell-integration `.zshenv` (which forces TERM=xterm-ghostty)
+    /// errors with `can't find terminal definition for xterm-ghostty`.
+    static func applyResourcesDirEnv(into env: inout [String: String]) {
+        func nonEmpty(_ s: String?) -> String? {
+            guard let s, !s.isEmpty else { return nil }
+            return s
+        }
+        let resourcesDir = nonEmpty(env["GHOSTTY_RESOURCES_DIR"])
+            ?? nonEmpty(ProcessInfo.processInfo.environment["GHOSTTY_RESOURCES_DIR"])
+        guard let resourcesDir else { return }
+        if env["GHOSTTY_RESOURCES_DIR"] == nil {
+            env["GHOSTTY_RESOURCES_DIR"] = resourcesDir
+        }
+        let resourcesParent = (resourcesDir as NSString).deletingLastPathComponent
+        guard !resourcesParent.isEmpty else { return }
+        let fm = FileManager.default
+        let terminfoPath = (resourcesParent as NSString).appendingPathComponent("terminfo")
+        if env["TERMINFO"] == nil, fm.fileExists(atPath: terminfoPath) {
+            env["TERMINFO"] = terminfoPath
+        }
+        if env["XDG_DATA_DIRS"] == nil {
+            env["XDG_DATA_DIRS"] = "\(resourcesParent):/usr/local/share:/usr/share"
+        }
+        let manPath = (resourcesParent as NSString).appendingPathComponent("man")
+        if fm.fileExists(atPath: manPath) {
+            let current = env["MANPATH"] ?? ""
+            env["MANPATH"] = current.isEmpty ? ":\(manPath)" : "\(current):\(manPath)"
+        }
+    }
+
+    static func resolveSpawn(
+        command: String?,
+        workingDirectory: String?,
+        environment: [String: String],
+        initialWinsize: Winsize
+    ) -> CmuxPTYSpawn {
+        var env = environment
+        if env["TERM"] == nil { env["TERM"] = manualTerm }
+        if env["COLORTERM"] == nil { env["COLORTERM"] = "truecolor" }
+        applyResourcesDirEnv(into: &env)
+
+        if let command, !command.isEmpty {
+            return CmuxPTYSpawn(
+                executablePath: "/bin/sh",
+                arguments: ["-c", command],
+                environment: env,
+                workingDirectory: workingDirectory,
+                initialWinsize: initialWinsize
+            )
+        }
+
+        let resolvedShell: String = {
+            if let envShell = env["SHELL"], !envShell.isEmpty { return envShell }
+            if let procShell = ProcessInfo.processInfo.environment["SHELL"], !procShell.isEmpty {
+                return procShell
+            }
+            return "/bin/zsh"
+        }()
+        // POSIX login-shell convention: argv[0] starts with `-`. Pass it via
+        // argv0 so CmuxPTY doesn't prepend the executable path on top.
+        let loginName = "-" + (resolvedShell as NSString).lastPathComponent
+        return CmuxPTYSpawn(
+            executablePath: resolvedShell,
+            argv0: loginName,
+            arguments: [],
+            environment: env,
+            workingDirectory: workingDirectory,
+            initialWinsize: initialWinsize
+        )
+    }
+}
+
 final class TerminalSurface: Identifiable, ObservableObject {
     final class SearchState: ObservableObject {
         @Published var needle: String
@@ -4475,6 +4578,15 @@ final class TerminalSurface: Identifiable, ObservableObject {
     private let maxPendingSocketInputBytes = 1_048_576
     private var backgroundSurfaceStartQueued = false
     private var surfaceCallbackContext: Unmanaged<GhosttySurfaceCallbackContext>?
+    /// Fleet manual-IO PTY for this surface when the `fleetManualPty.enabled`
+    /// debug toggle is on. Owns its own DispatchSources; must be torn down before
+    /// the Ghostty surface so the read handler can't dispatch into a freed
+    /// surface (see `tearDownManualPtyIfNeeded`).
+    private var manualPty: CmuxPTY?
+    /// Retained-`Unmanaged` opaque pointer to `manualPty`, kept so it can be
+    /// released when the surface or PTY tears down. Non-nil only while
+    /// `manualPty` is non-nil and Ghostty is holding it as `io_write_userdata`.
+    private var manualPtyWriteUserdata: UnsafeMutableRawPointer?
     /// The desired focus state for the Ghostty C surface. May be set before the
     /// C surface exists (e.g. during layout restoration); `createSurface`
     /// reapplies this value once the runtime surface exists, then keeps using it
@@ -4878,6 +4990,30 @@ final class TerminalSurface: Identifiable, ObservableObject {
 #endif
     }
 
+    /// Closes the manual-IO PTY and releases the Unmanaged userdata that
+    /// Ghostty was holding as `io_write_userdata`. Must be called BEFORE the
+    /// Ghostty surface is freed so the read handler can't dispatch into a
+    /// freed surface. Idempotent.
+    private func tearDownManualPtyIfNeeded() {
+        guard let pty = manualPty else {
+            if let userdata = manualPtyWriteUserdata {
+                Unmanaged<CmuxPTY>.fromOpaque(userdata).release()
+                manualPtyWriteUserdata = nil
+            }
+            return
+        }
+        manualPty = nil
+        pty.terminate()
+        pty.close()
+        if let userdata = manualPtyWriteUserdata {
+            Unmanaged<CmuxPTY>.fromOpaque(userdata).release()
+            manualPtyWriteUserdata = nil
+        }
+#if DEBUG
+        cmuxDebugLog("fleet.manualPty.teardown surface=\(id.uuidString.prefix(5))")
+#endif
+    }
+
     /// Explicitly free the Ghostty runtime surface. Idempotent — safe to call
     /// before deinit; deinit will skip the free if already torn down.
     @MainActor
@@ -4887,6 +5023,8 @@ final class TerminalSurface: Identifiable, ObservableObject {
 
         let callbackContext = surfaceCallbackContext
         surfaceCallbackContext = nil
+
+        tearDownManualPtyIfNeeded()
 
         let surfaceToFree = surface
         if let surfaceToFree {
@@ -5321,7 +5459,55 @@ final class TerminalSurface: Identifiable, ObservableObject {
             return value.withCString(body)
         }
 
+        // Fleet step 5.5B: when the debug toggle is on, take ownership of the
+        // PTY in Swift via CMUXPty. Ghostty stays purely a renderer/input layer
+        // in MANUAL io_mode. Spawn must happen BEFORE ghostty_surface_new so
+        // `io_write_userdata` is a live retained pointer the moment Ghostty
+        // starts dispatching keystrokes.
+        let manualPtyEnabled = FleetManualPtySettings.isEnabled()
+        var spawnedManualPty: CmuxPTY? = nil
+        if manualPtyEnabled {
+            let spawnConfig = FleetManualPtyLaunch.resolveSpawn(
+                command: resolvedCommand,
+                workingDirectory: resolvedWorkingDirectory,
+                environment: env,
+                initialWinsize: .fallback
+            )
+            do {
+                let pty = try CmuxPTY.spawn(spawnConfig)
+                spawnedManualPty = pty
+                let retained = Unmanaged.passRetained(pty).toOpaque()
+                manualPty = pty
+                manualPtyWriteUserdata = retained
+                surfaceConfig.io_mode = GHOSTTY_SURFACE_IO_MANUAL
+                surfaceConfig.io_write_cb = cmuxManualIoWriteTrampoline
+                surfaceConfig.io_write_userdata = retained
+#if DEBUG
+                cmuxDebugLog(
+                    "fleet.manualPty.spawn surface=\(id.uuidString.prefix(5)) " +
+                    "pid=\(pty.childPID) fd=\(pty.masterFD) " +
+                    "exec=\(spawnConfig.executablePath) args=\(spawnConfig.arguments.count)"
+                )
+#endif
+            } catch {
+#if DEBUG
+                cmuxDebugLog(
+                    "fleet.manualPty.spawn.failed surface=\(id.uuidString.prefix(5)) " +
+                    "err=\(String(describing: error)) — falling back to EXEC backend"
+                )
+#endif
+            }
+        }
+        let useManualIo = spawnedManualPty != nil
+
         let createWithCommandAndWorkingDirectory = {
+            if useManualIo {
+                // Manual IO owns spawn/cwd/initial_input itself. Leave the
+                // surfaceConfig command/working_directory/initial_input nil so
+                // Ghostty's exec path is fully skipped.
+                createSurface()
+                return
+            }
             withOptionalCString(resolvedCommand) { cCommand in
                 surfaceConfig.command = cCommand
                 withOptionalCString(resolvedWorkingDirectory) { cWorkingDir in
@@ -5339,6 +5525,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         if surface == nil {
             surfaceCallbackContext?.release()
             surfaceCallbackContext = nil
+            tearDownManualPtyIfNeeded()
             print("Failed to create ghostty surface")
             #if DEBUG
             Self.surfaceLog("createSurface FAILED surface=\(id.uuidString): ghostty_surface_new returned nil")
@@ -5387,6 +5574,41 @@ final class TerminalSurface: Identifiable, ObservableObject {
             lastPixelHeight = hpx
             lastXScale = scaleFactors.x
             lastYScale = scaleFactors.y
+        }
+
+        // Fleet step 5.5B: once Ghostty's surface exists and has been sized,
+        // wire the manual PTY's bytes into Ghostty's renderer, push the
+        // child-grid winsize, and request close on child exit. waitAfterCommand
+        // parity (showing "[process exited]" and keeping the surface live) is
+        // 5.5C work — for now the toggle is experimental and a quick close on
+        // exit is acceptable behaviour.
+        if let pty = manualPty {
+            let surfaceForCallback = createdSurface
+            pty.setOutputHandler { chunk in
+                guard let base = chunk.baseAddress?.assumingMemoryBound(to: CChar.self),
+                      !chunk.isEmpty else { return }
+                ghostty_surface_process_output(surfaceForCallback, base, UInt(chunk.count))
+            }
+            let surfaceId = id
+            pty.setExitHandler { _ in
+                // Surface may already be freed by the time main runs the
+                // close request. Check the registry to confirm the surface
+                // pointer is still owned by the same TerminalSurface id —
+                // otherwise the surface is gone and request_close would UAF.
+                Task { @MainActor in
+                    guard TerminalSurfaceRegistry.shared.runtimeSurfaceOwnerId(surfaceForCallback) == surfaceId else {
+#if DEBUG
+                        cmuxDebugLog("fleet.manualPty.exit.stale surface=\(surfaceId.uuidString.prefix(5))")
+#endif
+                        return
+                    }
+#if DEBUG
+                    cmuxDebugLog("fleet.manualPty.exit surface=\(surfaceId.uuidString.prefix(5))")
+#endif
+                    ghostty_surface_request_close(surfaceForCallback)
+                }
+            }
+            applyManualPtyWinsizeFromSurface(createdSurface)
         }
 
         // Some GhosttyKit builds can drop inherited font_size during post-create
@@ -5485,8 +5707,44 @@ final class TerminalSurface: Identifiable, ObservableObject {
             lastPixelHeight = hpx
         }
 
+        if sizeChanged, manualPty != nil {
+            applyManualPtyWinsizeFromSurface(surface)
+        }
+
         // Let Ghostty continue rendering on its own wakeups for steady-state frames.
         return true
+    }
+
+    /// Push the current surface grid dimensions to the manual PTY via
+    /// TIOCSWINSZ so the child shell sees the live columns × rows. Must be
+    /// called after `ghostty_surface_set_size` so Ghostty has computed cell
+    /// dimensions for the new pixel size.
+    private func applyManualPtyWinsizeFromSurface(_ surface: ghostty_surface_t) {
+        guard let pty = manualPty else { return }
+        let size = ghostty_surface_size(surface)
+        guard size.columns > 0, size.rows > 0 else { return }
+        let winsize = Winsize(
+            columns: UInt16(clamping: Int(size.columns)),
+            rows: UInt16(clamping: Int(size.rows)),
+            widthPixels: UInt16(clamping: Int(size.width_px)),
+            heightPixels: UInt16(clamping: Int(size.height_px))
+        )
+        do {
+            try pty.resize(winsize)
+#if DEBUG
+            cmuxDebugLog(
+                "fleet.manualPty.resize surface=\(id.uuidString.prefix(5)) " +
+                "cols=\(winsize.columns) rows=\(winsize.rows)"
+            )
+#endif
+        } catch {
+#if DEBUG
+            cmuxDebugLog(
+                "fleet.manualPty.resize.failed surface=\(id.uuidString.prefix(5)) " +
+                "err=\(String(describing: error))"
+            )
+#endif
+        }
     }
 
     /// Force a full size recalculation and surface redraw.
@@ -5949,6 +6207,8 @@ final class TerminalSurface: Identifiable, ObservableObject {
         let callbackContext = surfaceCallbackContext
         surfaceCallbackContext = nil
 
+        tearDownManualPtyIfNeeded()
+
         guard let surfaceToFree = surface else {
             callbackContext?.release()
             return
@@ -5969,6 +6229,8 @@ final class TerminalSurface: Identifiable, ObservableObject {
         let callbackContext = surfaceCallbackContext
         surfaceCallbackContext = nil
 
+        tearDownManualPtyIfNeeded()
+
         guard let surfaceToFree = surface else {
             callbackContext?.release()
             return
@@ -5987,6 +6249,8 @@ final class TerminalSurface: Identifiable, ObservableObject {
 
         let callbackContext = surfaceCallbackContext
         surfaceCallbackContext = nil
+
+        tearDownManualPtyIfNeeded()
 
         // Nil out the surface pointer so any in-flight closures (e.g. geometry
         // reconcile dispatched via DispatchQueue.main.async) that read self.surface

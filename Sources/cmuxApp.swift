@@ -13,6 +13,8 @@ struct cmuxApp: App {
     @AppStorage("titlebarControlsStyle") private var titlebarControlsStyle = TitlebarControlsStyle.classic.rawValue
     @AppStorage(DevBuildBannerDebugSettings.sidebarBannerVisibleKey)
     private var showSidebarDevBuildBanner = DevBuildBannerDebugSettings.defaultShowSidebarBanner
+    @AppStorage(FleetManualPtySettings.enabledKey)
+    private var fleetManualPtyEnabled = FleetManualPtySettings.defaultEnabled
     @AppStorage(SocketControlSettings.appStorageKey) private var socketControlMode = SocketControlSettings.defaultMode.rawValue
     @AppStorage(BrowserToolbarAccessorySpacingDebugSettings.key) private var browserToolbarAccessorySpacingRaw = BrowserToolbarAccessorySpacingDebugSettings.defaultSpacing
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
@@ -445,6 +447,11 @@ struct cmuxApp: App {
                 Toggle(
                     String(localized: "debug.devBuildBanner.show", defaultValue: "Show Dev Build Banner"),
                     isOn: $showSidebarDevBuildBanner
+                )
+
+                Toggle(
+                    "Fleet: Use Manual PTY (experimental)",
+                    isOn: $fleetManualPtyEnabled
                 )
 
                 Divider()

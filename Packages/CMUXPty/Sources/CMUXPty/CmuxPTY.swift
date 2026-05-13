@@ -366,7 +366,16 @@ private final class CmuxPTYCStringBundle {
         let execPtr = CmuxPTYCStringBundle.duplicate(spawn.executablePath)
         owned.append(execPtr)
 
-        var argvOwned: [UnsafeMutablePointer<CChar>] = [execPtr]
+        let argv0Ptr: UnsafeMutablePointer<CChar>
+        if let argv0 = spawn.argv0 {
+            let dup = CmuxPTYCStringBundle.duplicate(argv0)
+            owned.append(dup)
+            argv0Ptr = dup
+        } else {
+            argv0Ptr = execPtr
+        }
+
+        var argvOwned: [UnsafeMutablePointer<CChar>] = [argv0Ptr]
         for argument in spawn.arguments {
             let dup = CmuxPTYCStringBundle.duplicate(argument)
             argvOwned.append(dup)
