@@ -52,16 +52,22 @@ public final class NWFleetAttachClient: FleetAttachClient, @unchecked Sendable {
             runtime?.stop()
         }
         runtime.start()
+        // The session must hold the runtime *strongly* — otherwise ARC
+        // reclaims it the moment `attach` returns, the NWConnection's
+        // stateUpdateHandler hits `[weak self] = nil`, and the
+        // connection silently drops before reaching .ready. Caught
+        // during cross-host dogfood: every connect logged `[connecting]`
+        // then immediately `[disconnected]` with no error frame.
+        let strongRuntime = runtime
         return FleetAttachSession(
             workspaceId: trimmedWs,
             events: stream,
-            sendText: { @Sendable [weak runtime] text in
-                guard let runtime else { throw FleetAttachClientError.alreadyClosed }
+            sendText: { @Sendable text in
                 let bytes = FleetWebSocket.encodeMaskedText(text)
-                runtime.sendFrameSync(bytes)
+                strongRuntime.sendFrameSync(bytes)
             },
-            close: { @Sendable [weak runtime] in
-                runtime?.stop()
+            close: { @Sendable in
+                strongRuntime.stop()
             }
         )
     }
