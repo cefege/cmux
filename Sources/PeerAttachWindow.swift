@@ -281,10 +281,10 @@ private struct PeerAttachDebugView: View {
 
     private var connectionForm: some View {
         HStack(spacing: 8) {
-            TextField("Host (Tailscale IP)", text: $model.host)
+            TextField("Host (e.g. mihai-m1-eu.tailXXXXXX.ts.net)", text: $model.host)
                 .textFieldStyle(.roundedBorder)
                 .disabled(model.isConnected)
-                .frame(minWidth: 160)
+                .frame(minWidth: 220)
             TextField("Port", text: $model.port)
                 .textFieldStyle(.roundedBorder)
                 .disabled(model.isConnected)

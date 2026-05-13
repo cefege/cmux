@@ -164,19 +164,22 @@
 		<key>NSAllowsArbitraryLoadsInWebContent</key>
 		<true/>
 		<!-- Fleet talks to peers over plain ws:// inside the Tailscale
-		     WireGuard tunnel (already encrypted). ATS NSExceptionDomains
-		     can't match the 100.64.0.0/10 CGNAT range by IP and Apple's
-		     NSAllowsLocalNetworking heuristic doesn't cover it either, so
-		     we drop the global HTTPS requirement. The fleet service still
-		     binds only to the Tailscale interface and runs tailnet-auth
-		     on every connection, so this doesn't relax any auth posture. -->
-		<key>NSAllowsArbitraryLoads</key>
-		<true/>
-		<key>NSAllowsLocalNetworking</key>
-		<true/>
+		     WireGuard tunnel (already encrypted). Tailscale MagicDNS
+		     gives every node a `<host>.<tailnet>.ts.net` name, so we
+		     can scope the ATS exception to the `ts.net` suffix instead
+		     of disabling ATS globally. The fleet service still binds
+		     only to the Tailscale interface and runs tailnet-auth on
+		     every connection. -->
 		<key>NSExceptionDomains</key>
 		<dict>
 			<key>cmux-loopback.localtest.me</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+				<key>NSIncludesSubdomains</key>
+				<true/>
+			</dict>
+			<key>ts.net</key>
 			<dict>
 				<key>NSExceptionAllowsInsecureHTTPLoads</key>
 				<true/>
