@@ -106,9 +106,13 @@ public actor FleetCoordinator {
         await registerDefaultRoutes(router: router, identity: identity)
 
         let broadcaster = FleetEventBroadcaster(hostId: identity.hostId)
-        let endpoint = FleetWebSocketEndpoint(
-            path: "/v1/events",
+        let eventsEndpoint = FleetWebSocketEndpoint.exact(
+            "/v1/events",
             handler: Self.makeEventsHandler(broadcaster: broadcaster)
+        )
+        let attachEndpoint = FleetWebSocketEndpoint.template(
+            "/v1/workspaces/{id}/attach",
+            handler: Self.makeAttachStubHandler()
         )
 
         let (service, port) = try startServiceOnFirstAvailablePort(
@@ -116,7 +120,7 @@ public actor FleetCoordinator {
             probe: probe,
             userId: userId,
             handler: await router.makeHandler(),
-            webSocketEndpoint: endpoint
+            webSocketEndpoints: [eventsEndpoint, attachEndpoint]
         )
 
         let registry = FleetPeerRegistry(
@@ -187,6 +191,42 @@ public actor FleetCoordinator {
         }
     }
 
+    /// Step 6a scaffold for `/v1/workspaces/{id}/attach`. The full handler
+    /// will tee the local manual PTY's output to this channel and inject
+    /// frames received from the peer back as input. For now we acknowledge
+    /// the connection with a single JSON hello and close — enough to verify
+    /// path-template routing and to give clients a stable response shape.
+    private static func makeAttachStubHandler() -> FleetWebSocketHandler {
+        { channel, ctx in
+            let workspaceId = ctx.pathParams["id"] ?? ""
+            let payload: [String: Any] = [
+                "type": "attach_hello",
+                "workspaceId": workspaceId,
+                "status": "stub",
+            ]
+            if let data = try? JSONSerialization.data(
+                withJSONObject: payload,
+                options: [.sortedKeys]
+            ), let text = String(data: data, encoding: .utf8) {
+                channel.sendText(text)
+            }
+            // Drain any frames the client sends before closing so the receive
+            // loop can shut down cleanly. The stub doesn't process input yet.
+            let receiveStream = channel.start()
+            do {
+                for try await _ in receiveStream {
+                    // Discard the first frame; the stub doesn't process input
+                    // yet and the outer task closes the channel immediately
+                    // after this iteration.
+                    break
+                }
+            } catch {
+                // Receive errored — channel is being torn down. Nothing to do.
+            }
+            channel.close(code: 1000, reason: "attach stub")
+        }
+    }
+
     /// Falls back to ephemeral (port 0) only if every preferred port is in
     /// use; peers using FleetPort.default won't find a fallback-bound host,
     /// which is acceptable for DEV/STAGING side-by-side runs.
@@ -195,7 +235,7 @@ public actor FleetCoordinator {
         probe: TailscaleProbe,
         userId: Int64,
         handler: @escaping FleetRequestHandler,
-        webSocketEndpoint: FleetWebSocketEndpoint?
+        webSocketEndpoints: [FleetWebSocketEndpoint]
     ) throws -> (FleetService, UInt16) {
         var attempts: [UInt16] = preferredPorts
         attempts.append(0)
@@ -206,7 +246,7 @@ public actor FleetCoordinator {
                 probe: probe,
                 selfUserId: userId,
                 handler: handler,
-                webSocketEndpoint: webSocketEndpoint
+                webSocketEndpoints: webSocketEndpoints
             )
             do {
                 let port = try service.start()

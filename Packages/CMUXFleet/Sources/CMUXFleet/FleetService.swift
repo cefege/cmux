@@ -24,15 +24,84 @@ public struct FleetRequestContext: Sendable {
     public let peer: TailscaleWhois?
     public let peerAddress: String
     public let peerPort: UInt16
+    /// Path parameters extracted by a `FleetWebSocketEndpoint.template` matcher
+    /// (e.g. `["id": "<uuid>"]` for `/v1/workspaces/{id}/attach`). Empty for
+    /// HTTP routes and for literal-path WS endpoints.
+    public let pathParams: [String: String]
+
+    public init(
+        peer: TailscaleWhois?,
+        peerAddress: String,
+        peerPort: UInt16,
+        pathParams: [String: String] = [:]
+    ) {
+        self.peer = peer
+        self.peerAddress = peerAddress
+        self.peerPort = peerPort
+        self.pathParams = pathParams
+    }
 }
 
+/// A WebSocket route. The matcher inspects the request path and returns the
+/// extracted path parameters when the route applies, or nil to decline.
+///
+/// Construct with `.exact(_:handler:)` for literal paths like `/v1/events`,
+/// or `.template(_:handler:)` for routes with curly-brace parameter slots
+/// like `/v1/workspaces/{id}/attach`. FleetService picks the first matching
+/// endpoint in registration order, so register specific routes before
+/// catch-all ones.
 public struct FleetWebSocketEndpoint: Sendable {
-    public let path: String
+    public let label: String
+    public let matcher: @Sendable (String) -> [String: String]?
     public let handler: FleetWebSocketHandler
 
-    public init(path: String, handler: @escaping FleetWebSocketHandler) {
-        self.path = path
+    public init(
+        label: String,
+        matcher: @escaping @Sendable (String) -> [String: String]?,
+        handler: @escaping FleetWebSocketHandler
+    ) {
+        self.label = label
+        self.matcher = matcher
         self.handler = handler
+    }
+
+    public static func exact(
+        _ path: String,
+        handler: @escaping FleetWebSocketHandler
+    ) -> FleetWebSocketEndpoint {
+        FleetWebSocketEndpoint(
+            label: path,
+            matcher: { incoming in incoming == path ? [:] : nil },
+            handler: handler
+        )
+    }
+
+    public static func template(
+        _ template: String,
+        handler: @escaping FleetWebSocketHandler
+    ) -> FleetWebSocketEndpoint {
+        let segments = template.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        return FleetWebSocketEndpoint(
+            label: template,
+            matcher: { incoming in
+                let incomingSegments = incoming
+                    .split(separator: "/", omittingEmptySubsequences: false)
+                    .map(String.init)
+                guard incomingSegments.count == segments.count else { return nil }
+                var params: [String: String] = [:]
+                for (seg, actual) in zip(segments, incomingSegments) {
+                    if seg.hasPrefix("{"), seg.hasSuffix("}"), seg.count >= 2 {
+                        let name = String(seg.dropFirst().dropLast())
+                        guard !name.isEmpty, !actual.isEmpty else { return nil }
+                        params[name] = actual
+                    } else if seg != actual {
+                        return nil
+                    }
+                }
+                return params
+            },
+            handler: handler
+        )
     }
 }
 
@@ -63,7 +132,7 @@ public final class FleetService: @unchecked Sendable {
     private let probe: TailscaleProbe
     private let selfUserId: Int64
     private let handler: FleetRequestHandler
-    private let webSocketEndpoint: FleetWebSocketEndpoint?
+    private let webSocketEndpoints: [FleetWebSocketEndpoint]
     private let queue: DispatchQueue
     private let lock = NSLock()
     private var listener: NWListener?
@@ -78,13 +147,13 @@ public final class FleetService: @unchecked Sendable {
         probe: TailscaleProbe,
         selfUserId: Int64,
         handler: @escaping FleetRequestHandler,
-        webSocketEndpoint: FleetWebSocketEndpoint? = nil
+        webSocketEndpoints: [FleetWebSocketEndpoint] = []
     ) {
         self.config = config
         self.probe = probe
         self.selfUserId = selfUserId
         self.handler = handler
-        self.webSocketEndpoint = webSocketEndpoint
+        self.webSocketEndpoints = webSocketEndpoints
         self.queue = DispatchQueue(label: "cmux.fleet.service", qos: .userInitiated, attributes: .concurrent)
     }
 
@@ -240,12 +309,16 @@ public final class FleetService: @unchecked Sendable {
         case .rejected(let response):
             sendAndClose(connection: connection, response: response, cleanup: cleanup)
         case .accepted(let whois):
-            let context = FleetRequestContext(peer: whois, peerAddress: peerAddress, peerPort: peerPort)
-            if let endpoint = webSocketEndpoint,
-               request.method.uppercased() == "GET",
-               request.path == endpoint.path,
-               Self.isWebSocketUpgrade(request)
+            if request.method.uppercased() == "GET",
+               Self.isWebSocketUpgrade(request),
+               let (endpoint, pathParams) = matchWebSocketEndpoint(path: request.path)
             {
+                let context = FleetRequestContext(
+                    peer: whois,
+                    peerAddress: peerAddress,
+                    peerPort: peerPort,
+                    pathParams: pathParams
+                )
                 await performUpgrade(
                     connection: connection,
                     request: request,
@@ -255,10 +328,24 @@ public final class FleetService: @unchecked Sendable {
                     cleanup: cleanup
                 )
             } else {
+                let context = FleetRequestContext(
+                    peer: whois,
+                    peerAddress: peerAddress,
+                    peerPort: peerPort
+                )
                 let response = await handler(request, context)
                 sendAndClose(connection: connection, response: response, cleanup: cleanup)
             }
         }
+    }
+
+    private func matchWebSocketEndpoint(path: String) -> (FleetWebSocketEndpoint, [String: String])? {
+        for endpoint in webSocketEndpoints {
+            if let params = endpoint.matcher(path) {
+                return (endpoint, params)
+            }
+        }
+        return nil
     }
 
     private enum AuthResult {
