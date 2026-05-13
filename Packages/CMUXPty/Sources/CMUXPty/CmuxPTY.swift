@@ -9,6 +9,13 @@ public final class CmuxPTY: @unchecked Sendable {
     public let masterFD: Int32
     public let childPID: pid_t
 
+    private let stateQueue = DispatchQueue(label: "com.cmux.pty.state", qos: .userInitiated)
+    private var readSource: DispatchSourceRead?
+    private var exitSource: DispatchSourceProcess?
+    private var outputHandler: OutputHandler?
+    private var exitHandler: ExitHandler?
+    private var isClosed = false
+
     private init(masterFD: Int32, childPID: pid_t) {
         self.masterFD = masterFD
         self.childPID = childPID
@@ -35,12 +42,11 @@ public final class CmuxPTY: @unchecked Sendable {
         let cstrings = CmuxPTYCStringBundle(spawn: config)
         defer { cstrings.free() }
 
-        var errPipe: (read: Int32, write: Int32) = (-1, -1)
         var pipeFDs: [Int32] = [0, 0]
         if pipeFDs.withUnsafeMutableBufferPointer({ Darwin.pipe($0.baseAddress) }) != 0 {
             throw CmuxPTYError.fcntlFailed(errno: errno)
         }
-        errPipe = (pipeFDs[0], pipeFDs[1])
+        let errPipe = (read: pipeFDs[0], write: pipeFDs[1])
 
         // FD_CLOEXEC on both ends — write end vanishes on successful execve,
         // signalling success via EOF in the parent's read.
@@ -149,26 +155,143 @@ public final class CmuxPTY: @unchecked Sendable {
         return CmuxPTY(masterFD: masterFD, childPID: pid)
     }
 
+    /// Install a closure to be invoked with each chunk read from the master fd.
+    /// The buffer pointer is only valid for the duration of the call — copy if
+    /// you need to retain. Output that arrives between spawn and handler install
+    /// is held in the kernel's PTY buffer (typically 4-8 KB on macOS) and
+    /// delivered to the handler once installed.
     public func setOutputHandler(_ handler: @escaping OutputHandler) {
-        _ = handler
+        stateQueue.async { [weak self] in
+            guard let self = self, !self.isClosed else { return }
+            self.outputHandler = handler
+            if self.readSource == nil {
+                let source = DispatchSource.makeReadSource(
+                    fileDescriptor: self.masterFD,
+                    queue: self.stateQueue
+                )
+                source.setEventHandler { [weak self] in
+                    self?.drainReadable()
+                }
+                self.readSource = source
+                source.resume()
+            }
+        }
     }
 
+    /// Install a closure to be invoked when the child process exits. Fires once
+    /// per CmuxPTY instance; if the child has already exited and not been
+    /// reaped, the handler fires immediately on installation.
     public func setExitHandler(_ handler: @escaping ExitHandler) {
-        _ = handler
+        stateQueue.async { [weak self] in
+            guard let self = self, !self.isClosed else { return }
+            self.exitHandler = handler
+            if self.exitSource == nil {
+                let source = DispatchSource.makeProcessSource(
+                    identifier: self.childPID,
+                    eventMask: .exit,
+                    queue: self.stateQueue
+                )
+                source.setEventHandler { [weak self] in
+                    self?.collectExit()
+                }
+                self.exitSource = source
+                source.resume()
+            }
+        }
     }
 
+    /// Synchronously write `bytes` to the master fd. The master is non-blocking;
+    /// EAGAIN is reported as `.writeFailed(errno: EAGAIN)` and the caller is
+    /// expected to retry. 5.5B layers a ring buffer + writability source so the
+    /// Ghostty IO thread never blocks on a full kernel buffer.
     public func write(_ bytes: UnsafeRawBufferPointer) throws {
-        _ = bytes
-        throw CmuxPTYError.notYetSpawned
+        guard let base = bytes.baseAddress, !bytes.isEmpty else { return }
+        var written = 0
+        while written < bytes.count {
+            let n = Darwin.write(masterFD, base.advanced(by: written), bytes.count - written)
+            if n > 0 {
+                written += n
+                continue
+            }
+            if n == -1 {
+                if errno == EINTR { continue }
+                throw CmuxPTYError.writeFailed(errno: errno)
+            }
+            break
+        }
     }
 
-    public func resize(_ winsize: Winsize) throws {
-        _ = winsize
-        throw CmuxPTYError.notYetSpawned
+    /// Resize the slave terminal so the child sees the new grid dimensions.
+    public func resize(_ size: Winsize) throws {
+        var ws = winsizeFromConfig(size)
+        let result = withUnsafeMutablePointer(to: &ws) { ptr in
+            Darwin.ioctl(masterFD, UInt(TIOCSWINSZ), ptr)
+        }
+        if result != 0 {
+            throw CmuxPTYError.ioctlFailed(errno: errno)
+        }
     }
 
+    /// Send SIGHUP to the child. Fire and forget — the exit handler (if set)
+    /// observes the death asynchronously. Source state and the master fd stay
+    /// alive so the exit notification can still fire; call `close()` after the
+    /// child is reaped to release everything.
     public func terminate() {
         _ = Darwin.kill(childPID, SIGHUP)
+    }
+
+    /// Cancel the read / exit sources, drop handler references, and close the
+    /// master fd. Idempotent. Safe to call without prior `terminate()`. Must
+    /// happen before the master fd is otherwise closed — DispatchSource has
+    /// undefined behaviour if its fd is closed out from under it.
+    public func close() {
+        let group = DispatchGroup()
+        group.enter()
+        stateQueue.async { [weak self] in
+            defer { group.leave() }
+            guard let self = self, !self.isClosed else { return }
+            self.isClosed = true
+            self.readSource?.cancel()
+            self.readSource = nil
+            self.exitSource?.cancel()
+            self.exitSource = nil
+            self.outputHandler = nil
+            self.exitHandler = nil
+        }
+        _ = group.wait(timeout: .now() + 1.0)
+        _ = Darwin.close(masterFD)
+    }
+
+    // MARK: - Source handlers (stateQueue)
+
+    private func drainReadable() {
+        let bufferSize = 64 * 1024
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: bufferSize, alignment: 1)
+        defer { buffer.deallocate() }
+        while true {
+            let n = Darwin.read(masterFD, buffer, bufferSize)
+            if n > 0 {
+                let chunk = UnsafeRawBufferPointer(start: buffer, count: n)
+                outputHandler?(chunk)
+                continue
+            }
+            if n == 0 { break }                          // EOF on master
+            if errno == EINTR { continue }
+            if errno == EAGAIN || errno == EWOULDBLOCK { break }
+            break
+        }
+    }
+
+    private func collectExit() {
+        var status: Int32 = 0
+        let r = Darwin.waitpid(childPID, &status, WNOHANG)
+        if r <= 0 { return }
+        let exit = CmuxPTYExitStatus(reason: exitReason(rawStatus: status), rawStatus: status)
+        let handler = exitHandler
+        exitHandler = nil
+        exitSource?.cancel()
+        exitSource = nil
+        handler?(exit)
     }
 }
 
@@ -208,6 +331,18 @@ private func reportChildError(_ fd: Int32, code: Int32) {
             return
         }
     }
+}
+
+/// POSIX status decoding without C macros.
+private func exitReason(rawStatus: Int32) -> CmuxPTYExitStatus.Reason {
+    let termSignal = rawStatus & 0x7F
+    if termSignal == 0 {
+        return .exited(code: (rawStatus >> 8) & 0xFF)
+    }
+    if termSignal != 0x7F {
+        return .signaled(signal: termSignal)
+    }
+    return .unknown
 }
 
 // MARK: - C-string lifetime bundle

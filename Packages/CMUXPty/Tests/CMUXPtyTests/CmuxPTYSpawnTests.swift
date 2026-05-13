@@ -2,8 +2,8 @@ import Darwin
 import XCTest
 @testable import CMUXPty
 
-final class CmuxPTYSkeletonTests: XCTestCase {
-    func testWinsizeFallback() {
+final class CmuxPTYSpawnTests: XCTestCase {
+    func testWinsizeFallbackDefaults() {
         let ws = Winsize.fallback
         XCTAssertEqual(ws.columns, 80)
         XCTAssertEqual(ws.rows, 24)
@@ -31,24 +31,18 @@ final class CmuxPTYSkeletonTests: XCTestCase {
         }
     }
 
-    func testSpawnSucceedsForShellSleep() throws {
+    func testSpawnSetsNonBlockingAndCloseOnExec() throws {
         let pty = try CmuxPTY.spawn(
             CmuxPTYSpawn(
                 executablePath: "/bin/sh",
                 arguments: ["-c", "sleep 30"]
             )
         )
-        defer {
-            pty.terminate()
-            var status: Int32 = 0
-            _ = Darwin.waitpid(pty.childPID, &status, 0)
-            _ = Darwin.close(pty.masterFD)
-        }
+        defer { reap(pty) }
 
         XCTAssertGreaterThan(pty.masterFD, 0)
         XCTAssertGreaterThan(pty.childPID, 0)
 
-        // Master fd should be non-blocking + close-on-exec.
         let flags = fcntl(pty.masterFD, F_GETFL, 0)
         XCTAssertNotEqual(flags, -1)
         XCTAssertEqual(flags & O_NONBLOCK, O_NONBLOCK, "master fd should be non-blocking")
