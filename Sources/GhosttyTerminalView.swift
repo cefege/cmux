@@ -4394,6 +4394,14 @@ enum TerminalSurfaceFocusPlacement: Equatable {
 /// `CmuxPTY.write` handles backpressure internally via an SPSC ring buffer
 /// drained by a DispatchSource.makeWriteSource — EAGAIN does not escape.
 /// Only unrecoverable errors (EIO, EBADF, etc.) reach this catch.
+///
+/// 5.5D instrumentation: any single trampoline call that exceeds
+/// `fleetManualPtySlowWriteThresholdUs` is logged as `fleet.manualPty.slow_write`
+/// so the burn-in dogfood loop can grep for typing-latency outliers without
+/// needing a synchronous benchmark. The threshold is intentionally tight (1 ms)
+/// because Ghostty's IO thread queues these writes inline with renderer ticks
+/// and anything over a frame is a regression worth investigating.
+private let fleetManualPtySlowWriteThresholdUs: UInt64 = 1_000
 private func cmuxManualIoWriteTrampoline(
     _ userdata: UnsafeMutableRawPointer?,
     _ ptr: UnsafePointer<CChar>?,
@@ -4402,6 +4410,9 @@ private func cmuxManualIoWriteTrampoline(
     guard let userdata, let ptr, len > 0 else { return }
     let pty = Unmanaged<CmuxPTY>.fromOpaque(userdata).takeUnretainedValue()
     let buffer = UnsafeRawBufferPointer(start: ptr, count: Int(len))
+#if DEBUG
+    let startNs = DispatchTime.now().uptimeNanoseconds
+#endif
     do {
         try pty.write(buffer)
     } catch {
@@ -4409,6 +4420,15 @@ private func cmuxManualIoWriteTrampoline(
         cmuxDebugLog("fleet.manualPty.write.error bytes=\(len) err=\(String(describing: error))")
 #endif
     }
+#if DEBUG
+    let durationUs = (DispatchTime.now().uptimeNanoseconds &- startNs) / 1_000
+    if durationUs > fleetManualPtySlowWriteThresholdUs {
+        cmuxDebugLog(
+            "fleet.manualPty.slow_write bytes=\(len) duration_us=\(durationUs) " +
+            "dropped_total=\(pty.writeBufferDroppedBytes)"
+        )
+    }
+#endif
 }
 
 private enum FleetManualPtyLaunch {
